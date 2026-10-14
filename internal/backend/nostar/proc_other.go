@@ -2,6 +2,11 @@
 
 package nostar
 
-import "syscall"
+import (
+	"net"
+	"syscall"
+)
 
 func sysProcAttr() *syscall.SysProcAttr { return &syscall.SysProcAttr{} }
+
+func quickAck(*net.TCPConn) {}

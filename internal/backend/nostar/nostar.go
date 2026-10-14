@@ -380,6 +380,7 @@ func (in *instance) Recv() (*backend.Frame, error) {
 			}
 		} else {
 			in.conn.SetReadDeadline(time.Now().Add(in.opt.Watchdog))
+			quickAck(in.conn)
 			if _, err := io.ReadFull(in.conn, in.raw[:]); err != nil {
 				return nil, in.linkErr(err)
 			}
@@ -425,6 +426,7 @@ func (in *instance) nextV2() (*backend.Frame, error, bool) {
 			return FromPacket(&p, outputs), nil, true
 		case V2NeedMore:
 			in.conn.SetReadDeadline(time.Now().Add(in.opt.Watchdog))
+			quickAck(in.conn)
 			n, err := in.conn.Read(in.rbuf[:])
 			if n > 0 {
 				in.rx.Append(in.rbuf[:n])
