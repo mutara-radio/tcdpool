@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -140,6 +141,13 @@ func (c Config) Validate() error {
 	}
 	if !c.TLS.Disable && !c.TLS.SelfSigned && (c.TLS.Cert == "" || c.TLS.Key == "") {
 		errs = append(errs, errors.New("tls: give cert and key, or set self_signed"))
+	}
+	if c.AdminListen != "" {
+		host, _, err := net.SplitHostPort(c.AdminListen)
+		ip := net.ParseIP(host)
+		if err != nil || (host != "localhost" && (ip == nil || !ip.IsLoopback())) {
+			errs = append(errs, fmt.Errorf("admin_listen %q must be a loopback address (or empty to turn it off)", c.AdminListen))
+		}
 	}
 	if c.KeysFile == "" {
 		errs = append(errs, errors.New("keys_file is empty"))
