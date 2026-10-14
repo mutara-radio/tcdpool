@@ -1,0 +1,38 @@
+{
+  "listen": ":8443",
+  "tls": {
+    "cert": "",
+    "key": "",
+    "self_signed": true,
+    "disable": false
+  },
+  "admin_listen": "127.0.0.1:9180",
+  "keys_file": "/var/lib/tcdpool/keys.json",
+  "backend": {
+    "binary": "/opt/tcdpool/tcd",
+    "work_dir": "/var/lib/tcdpool/run",
+    "port_min": 40000,
+    "port_max": 48999,
+    "framing": "v2",
+    "gains": {
+      "dstar_in": 0,
+      "dstar_out": 0,
+      "dmr_in": 0,
+      "dmr_out": 0,
+      "usrp_tx": 0,
+      "usrp_rx": 0
+    },
+    "connect_timeout": "15s",
+    "watchdog": "20s"
+  },
+  "idle_timeout": "60s",
+  "max_processes": 8,
+  "key_max_processes": 2,
+  "late_after": "60ms",
+  "missing_after": "2s",
+  "restart": {
+    "min_backoff": "500ms",
+    "max_backoff": "30s",
+    "max_failures": 5
+  }
+}
