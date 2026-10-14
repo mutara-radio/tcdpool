@@ -50,6 +50,10 @@ var (
 	ErrNotReady     = errors.New("the transcoder is restarting")
 	ErrBacklog      = errors.New("too many frames are waiting for the transcoder")
 	ErrDetached     = errors.New("the session is not attached")
+	// ErrDuplicate: a frame with the same stream ID and sequence is
+	// still in the transcoder. Replies are matched by the pair, so the
+	// pair must be unique among the frames in flight.
+	ErrDuplicate = errors.New("a frame with this stream ID and sequence is still in the transcoder")
 )
 
 // Sink receives the events of an attachment. Its methods must not block.
@@ -480,6 +484,11 @@ func (pr *Proc) send(a *Attachment, f *backend.Frame, want codec.Set) error {
 		return ErrBacklog
 	}
 	k := pkey{f.StreamID, f.Seq}
+	if _, dup := pr.pending[k]; dup {
+		pr.dropped++
+		pr.mu.Unlock()
+		return ErrDuplicate
+	}
 	pr.pending[k] = pend{sent: time.Now(), want: want, in: f.In}
 	pr.framesIn++
 	pr.mu.Unlock()

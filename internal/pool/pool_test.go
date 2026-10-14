@@ -148,6 +148,26 @@ func TestSendReply(t *testing.T) {
 	}
 }
 
+func TestDuplicateInFlight(t *testing.T) {
+	p, _ := testPool(t, "v2", nil)
+	a, s, _ := attach(t, p, "k1", "s1", 2)
+	if err := a.Send(cmd(5, faketcd.CmdSlow, 300), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Send(pcm(5), 0); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("duplicate in flight: %v", err)
+	}
+	s.wait(t, "reply", 3*time.Second)
+	// after the reply the pair is free again
+	if err := a.Send(pcm(5), 0); err != nil {
+		t.Fatal(err)
+	}
+	s.wait(t, "reply", 3*time.Second)
+	if st := a.Stats(); st.Desyncs != 0 || st.Dropped != 1 || st.FramesOut != 2 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
 func TestReuseAndIdleStop(t *testing.T) {
 	p, _ := testPool(t, "v2", func(o *Options) { o.IdleTimeout = 500 * time.Millisecond })
 	a, _, _ := attach(t, p, "k1", "s1", 2)

@@ -374,8 +374,18 @@ func (ss *session) readLoop(ctx context.Context) bool {
 		} else {
 			copy(f.Payload(req.In), req.Payload)
 		}
-		if err := ss.att.Send(f, want); errors.Is(err, pool.ErrDetached) {
+		switch err := ss.att.Send(f, want); {
+		case errors.Is(err, pool.ErrDetached):
 			return false
+		case errors.Is(err, pool.ErrDuplicate):
+			if badFrames++; badFrames <= 3 {
+				ss.sendJSON(protocol.Error{Type: protocol.MsgError, Code: protocol.ErrBadFrameCode,
+					Message: fmt.Sprintf("stream %#04x seq %d: %v", req.StreamID, req.Seq, err)})
+			}
+		case errors.Is(err, pool.ErrBacklog):
+			if badFrames++; badFrames <= 3 {
+				ss.sendJSON(protocol.Error{Type: protocol.MsgError, Code: protocol.ErrBacklog, Message: err.Error()})
+			}
 		}
 	}
 }
