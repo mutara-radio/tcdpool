@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:26:19 -0400
-Subject: [PATCH 11/11] Controller: transcode only the requested outputs
+Subject: [PATCH 11/12] Controller: transcode only the requested outputs
 
 tcd decoded every packet and then encoded it into every codec, also when
 the reflector needed only one of them. For software vocoders this costs

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:11:55 -0400
-Subject: [PATCH 07/11] TCSocket: refuse a packet for another module
+Subject: [PATCH 07/12] TCSocket: refuse a packet for another module
 
 Each module has its own TCP link, but the module byte inside a
 received packet was never checked. A packet with a letter that is not

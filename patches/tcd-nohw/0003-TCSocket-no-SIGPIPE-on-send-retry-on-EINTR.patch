@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:10:37 -0400
-Subject: [PATCH 03/11] TCSocket: no SIGPIPE on send, retry on EINTR
+Subject: [PATCH 03/12] TCSocket: no SIGPIPE on send, retry on EINTR
 
 Send() used send(..., 0). When the peer has closed the connection,
 the next send raises SIGPIPE, and the default action ends the whole

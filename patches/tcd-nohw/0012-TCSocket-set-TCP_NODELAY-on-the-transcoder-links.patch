@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:54:13 -0400
+Subject: [PATCH 12/12] TCSocket: set TCP_NODELAY on the transcoder links
+
+The link carries one small packet every 20 ms in each direction. With
+Nagle's algorithm a reply can wait for the ACK of the reply before it,
+and the peer can delay that ACK until it sends its next packet. With
+frames paced at 20 ms this added about one frame to each reply: a
+measured average of 25 ms against 3 ms with TCP_NODELAY.
+
+Set TCP_NODELAY on both ends: the socket of CTCClient::Connect and the
+sockets that CTCServer accepts.
+---
+ TCSocket.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/TCSocket.cpp b/TCSocket.cpp
+index b082715..631f396 100644
+--- a/TCSocket.cpp
++++ b/TCSocket.cpp
+@@ -22,6 +22,8 @@
+ #include <sys/types.h>
+ #include <sys/socket.h>
+ #include <sys/select.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
+ #include <cerrno>
+ 
+ #include "TCSocket.h"
+@@ -169,6 +171,18 @@ bool CTCSocket::Send(const STCPacket *packet, uint8_t outputs)
+ 	return false;
+ }
+ 
++// The link carries one small packet every 20 ms in each direction, and
++// each packet must go out at once. With Nagle's algorithm a packet can
++// wait for the ACK of the one before it, and the peer can delay that
++// ACK until its next packet: that adds up to one frame (20 ms or more)
++// to each reply. A failure here is not fatal; the link still works.
++static void SetNoDelay(int fd)
++{
++	int yes = 1;
++	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)))
++		perror("setsockopt TCP_NODELAY");
++}
++
+ // Read exactly one wire packet (TCPacketWireSize bytes) from fd.
+ // Returns true on an error or a disconnect; the caller closes fd.
+ //
+@@ -460,6 +474,7 @@ bool CTCServer::acceptone(int fd)
+ 		perror("Accept accept");
+ 		return true;
+ 	}
++	SetNoDelay(newfd);
+ 
+ 	char mod;
+ 	int rv = recv(newfd, &mod, 1, MSG_WAITALL);	// block to get the identification byte
+@@ -559,6 +574,8 @@ bool CTCClient::Connect(char module)
+ 		}
+ 	}
+ 
++	SetNoDelay(fd);
++
+ 	int sent = send(fd, &module, 1, 0); // send the identification byte
+ 	if (sent < 0)
+ 	{

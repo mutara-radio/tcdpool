@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:10:28 -0400
-Subject: [PATCH 02/11] TCSocket: read exactly one packet, never use a partial
+Subject: [PATCH 02/12] TCSocket: read exactly one packet, never use a partial
  one
 
 receive() called recv(MSG_WAITALL) once. That call can return fewer

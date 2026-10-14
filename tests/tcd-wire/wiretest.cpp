@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <thread>
+#include <atomic>
 #include <unistd.h>
 #include <vector>
 #include <chrono>
@@ -370,6 +371,65 @@ static std::string Timing(STcd &t, const char *label, ECodecType in, uint8_t out
 	return "";
 }
 
+// Frames sent every 20 ms by one thread while this thread reads the
+// replies, as a real client does. The test socket delays its ACKs (the
+// Linux default); without TCP_NODELAY on the tcd side, Nagle's
+// algorithm then holds each reply until the next frame comes in.
+static std::string Paced(STcd &t, uint8_t outputs, uint16_t sid)
+{
+	const int n = 100;
+	std::vector<Clock::time_point> sent(n);
+	std::vector<long> us;
+	std::atomic<bool> sendFailed{false};
+	std::thread sender([&] {
+		auto next = Clock::now();
+		for (int i = 0; i < n; i++)
+		{
+			STCPacket p = Usrp(uint32_t(i), sid);
+			auto w = t.Wire(p, outputs);
+			sent[i] = Clock::now();
+			if (! t.SendBytes(w.data(), w.size()))
+			{
+				sendFailed = true;
+				return;
+			}
+			next += std::chrono::milliseconds(20);
+			std::this_thread::sleep_until(next);
+		}
+	});
+	std::string err;
+	for (int got = 0; got < n; got++)
+	{
+		STCPacket r;
+		if (t.Read(r, 2000) != 1)
+		{
+			err = "no reply after " + std::to_string(got) + " replies";
+			break;
+		}
+		auto now = Clock::now();
+		if (r.sequence >= uint32_t(n))
+		{
+			err = "reply with a bad sequence";
+			break;
+		}
+		us.push_back(long(std::chrono::duration_cast<std::chrono::microseconds>(now - sent[r.sequence]).count()));
+	}
+	sender.join();
+	if (! err.empty())
+		return err;
+	if (sendFailed)
+		return "send failed";
+	std::sort(us.begin(), us.end());
+	long sum = 0;
+	for (auto v : us) sum += v;
+	const long avg = sum / long(us.size());
+	std::cout << "PACED outputs=" << Hex(outputs) << " n=" << us.size() << " min_us=" << us.front() << " avg_us=" << avg
+	          << " p50_us=" << us[us.size() / 2] << " max_us=" << us.back() << std::endl;
+	if (avg > 10000)
+		return "average reply time " + std::to_string(avg) + " us is more than 10 ms (Nagle on the tcd socket?)";
+	return "";
+}
+
 struct SScenario
 {
 	const char *name;
@@ -471,6 +531,8 @@ int main(int argc, char **argv)
 			  return RoundTrip(t, 200, 0x0405);
 		  } },
 
+		{ "raw_paced_latency", false, [](STcd &t) -> std::string { return Paced(t, 0, 0x1301); } },
+		{ "v2_paced_latency", true, [](STcd &t) -> std::string { return Paced(t, TCOut(ECodecType::dmr), 0x1302); } },
 		{ "v2_round_trip", true, [](STcd &t) -> std::string { return RoundTrip(t, 1, 0x1001); } },
 		{ "v2_split_writes", true, [](STcd &t) -> std::string {
 			  auto w = t.Wire(Usrp(2, 0x1002));

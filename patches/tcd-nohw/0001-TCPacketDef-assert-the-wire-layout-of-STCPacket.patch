@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:10:11 -0400
-Subject: [PATCH 01/11] TCPacketDef: assert the wire layout of STCPacket
+Subject: [PATCH 01/12] TCPacketDef: assert the wire layout of STCPacket
 
 The reflector and tcd send STCPacket as raw bytes, so sizeof and
 the field offsets are the wire format. Add static_asserts for the

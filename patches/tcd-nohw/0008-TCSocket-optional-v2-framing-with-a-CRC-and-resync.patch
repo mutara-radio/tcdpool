@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:13:49 -0400
-Subject: [PATCH 08/11] TCSocket: optional v2 framing with a CRC and resync
+Subject: [PATCH 08/12] TCSocket: optional v2 framing with a CRC and resync
 
 With raw framing the link is a plain run of 376-byte packets. One
 lost, extra or changed byte puts every later packet out of step, and

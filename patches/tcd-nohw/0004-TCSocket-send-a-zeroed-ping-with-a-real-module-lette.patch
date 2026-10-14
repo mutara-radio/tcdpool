@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:10:46 -0400
-Subject: [PATCH 04/11] TCSocket: send a zeroed ping with a real module letter
+Subject: [PATCH 04/12] TCSocket: send a zeroed ping with a real module letter
 
 ReConnect() sent its keep-alive ping from an uninitialized STCPacket on
 the stack. Only codec_in was set, so 375 bytes of old stack memory went
