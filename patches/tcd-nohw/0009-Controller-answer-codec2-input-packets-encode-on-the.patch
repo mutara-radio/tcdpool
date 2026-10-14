@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:13:49 -0400
+Subject: [PATCH 09/11] Controller: answer codec2 input packets, encode on the
+ codec threads
+
+Codec2toAudio() decoded the M17 data and then encoded D-Star, AMBE+2,
+IMBE and USRP itself, on the codec2 thread. Two problems:
+
+- It never called SendToReflector(), so a packet with codec_in c2_1600
+  or c2_3200 was never sent back.
+- The AMBE, AMBE+2 (md380 emulator) and IMBE vocoder objects are also
+  used by their own threads at the same time, without a lock.
+
+Push the decoded packet onto the ambe, swambe2, imbe and usrp queues,
+as AMBEtoAudio() and the other decoders already do. Those threads
+handle c2 input already, apply the configured gains, and the last one
+to finish sends the reply.
+---
+ Controller.cpp | 20 +++++++++-----------
+ 1 file changed, 9 insertions(+), 11 deletions(-)
+
+diff --git a/Controller.cpp b/Controller.cpp
+index 3035a81..2f79a49 100644
+--- a/Controller.cpp
++++ b/Controller.cpp
+@@ -169,9 +169,6 @@ void CController::AudiotoCodec2(std::shared_ptr<CTranscoderPacket> packet)
+ // push the packet onto both the dstar and the dmr queue.
+ void CController::Codec2toAudio(std::shared_ptr<CTranscoderPacket> packet)
+ {
+-	uint8_t ambe[9];
+-	uint8_t imbe[11];
+-
+ 	if (packet->IsSecond())
+ 	{
+ 		if (packet->GetCodecIn() == ECodecType::c2_1600)
+@@ -212,14 +209,15 @@ void CController::Codec2toAudio(std::shared_ptr<CTranscoderPacket> packet)
+ 			packet->SetAudioSamples(tmp, false);
+ 		}
+ 	}
+-	// the only thing left is to encode the two ambe, so push the packet onto both AMBE queues
+-	ambevocoder.encode_2400x1200((int16_t *)packet->GetAudioSamples(), ambe);
+-	packet->SetDStarData(ambe);
+-	md380_encode_fec(ambe, (int16_t *)packet->GetAudioSamples());
+-	packet->SetDMRData(ambe);
+-	p25vocoder.encode_4400((int16_t*)packet->GetAudioSamples(), imbe);
+-	packet->SetP25Data(imbe);
+-	packet->SetUSRPData((int16_t*)packet->GetAudioSamples());
++	// Hand the audio to the encoder threads, as the other decoders do.
++	// The last encoder to finish sends the reply. The old code encoded
++	// here, on the codec2 thread, at the same time as the AMBE, AMBE+2
++	// and IMBE threads used the same vocoder objects, and it never sent
++	// the reply, so a codec2 input packet was never answered.
++	ambe_queue.push(packet);
++	swambe2_queue.push(packet);
++	imbe_queue.push(packet);
++	usrp_queue.push(packet);
+ }
+ 
+ void CController::ProcessC2Thread()

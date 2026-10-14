@@ -1,0 +1,602 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:13:49 -0400
+Subject: [PATCH 08/11] TCSocket: optional v2 framing with a CRC and resync
+
+With raw framing the link is a plain run of 376-byte packets. One
+lost, extra or changed byte puts every later packet out of step, and
+only a new connection fixes it.
+
+Add an opt-in v2 framing (tcd.ini: Framing = v2; the default stays
+raw, so an unchanged reflector keeps working). After the one
+module-letter byte, each packet, pings too, is sent as:
+
+  'TCD2' | version u8 (1) | flags u8 (0) | length u16 LE |
+  payload (TCPacketCodec encoding) | CRC-32/IEEE u32 LE over
+  version..payload
+
+The reader (CV2Reader in TCFraming.{h,cpp}) checks magic, version,
+length bounds (376..1024, bytes after 376 are ignored so later versions
+can add fields) and CRC. A bad frame is counted, logged once per
+burst, and skipped: the reader scans forward to the next magic and
+goes on. It closes the link only after 8 bad frames in a row or 64 KiB
+of bytes outside a frame. A good frame that names another module counts
+as a bad frame.
+
+Only the tcd (client) side implements v2. CTCServer refuses to open in
+v2 mode.
+---
+ Configure.cpp  |  16 +++++
+ Configure.h    |   4 ++
+ Controller.cpp |   1 +
+ TCFraming.cpp  | 164 +++++++++++++++++++++++++++++++++++++++++++++++++
+ TCFraming.h    |  84 +++++++++++++++++++++++++
+ TCSocket.cpp   | 107 ++++++++++++++++++++++++++++++--
+ TCSocket.h     |   9 +++
+ config/tcd.ini |   5 ++
+ 8 files changed, 384 insertions(+), 6 deletions(-)
+ create mode 100644 TCFraming.cpp
+ create mode 100644 TCFraming.h
+
+diff --git a/Configure.cpp b/Configure.cpp
+index c0c57ee..dce34ed 100644
+--- a/Configure.cpp
++++ b/Configure.cpp
+@@ -34,6 +34,7 @@
+ #define MODULES        "Modules"
+ #define SERVERADDRESS  "ServerAddress"
+ #define PORT           "Port"
++#define FRAMING        "Framing"
+ 
+ static inline void split(const std::string &s, char delim, std::vector<std::string> &v)
+ {
+@@ -116,6 +117,20 @@ bool CConfigure::ReadData(const std::string &path)
+ 			porttmp.assign(value);
+ 		else if (0 == key.compare(MODULES))
+ 			modstmp.assign(value);
++		else if (0 == key.compare(FRAMING))
++		{
++			std::string v(value);
++			std::transform(v.begin(), v.end(), v.begin(), ::tolower);
++			if (v == "raw")
++				framing = EFraming::raw;
++			else if (v == "v2")
++				framing = EFraming::v2;
++			else
++			{
++				std::cerr << "ERROR: " << FRAMING << " must be 'raw' or 'v2', not '" << value << "'. Halt." << std::endl;
++				return true;
++			}
++		}
+ 		else if (0 == key.compare(DSTARGAININ))
+ 			dstar_in = getSigned(key, value);
+ 		else if (0 == key.compare(DSTARGAINOUT))
+@@ -165,6 +180,7 @@ bool CConfigure::ReadData(const std::string &path)
+ 	std::cout << MODULES << " = " << tcmods << std::endl;
+ 	std::cout << SERVERADDRESS << " = " << address << std::endl;
+ 	std::cout << PORT << " = " << port << std::endl;
++	std::cout << FRAMING << " = " << (EFraming::v2 == framing ? "v2" : "raw") << std::endl;
+ 	std::cout << DSTARGAININ << " = " << dstar_in << std::endl;
+ 	std::cout << DSTARGAINOUT << " = " << dstar_out << std::endl;
+ 	std::cout << DMRGAININ << " = " << dmr_in << std::endl;
+diff --git a/Configure.h b/Configure.h
+index f5313df..2ad9f42 100644
+--- a/Configure.h
++++ b/Configure.h
+@@ -22,6 +22,8 @@
+ #include <string>
+ #include <regex>
+ 
++#include "TCFraming.h"
++
+ enum class EGainType { dmrin, dmrout, dstarin, dstarout, usrptx, usrprx };
+ 
+ #define IS_TRUE(a) ((a)=='t' || (a)=='T' || (a)=='1')
+@@ -34,11 +36,13 @@ public:
+ 	std::string GetTCMods(void) const { return tcmods; }
+ 	std::string GetAddress(void) const { return address; }
+ 	unsigned GetPort(void) const { return port; }
++	EFraming GetFraming(void) const { return framing; }
+ 
+ private:
+ 	// CFGDATA data;
+ 	std::string tcmods, address;
+ 	uint16_t port;
++	EFraming framing = EFraming::raw;
+ 	int dstar_in, dstar_out, dmr_in, dmr_out, usrp_tx, usrp_rx;
+ 
+ 	int getSigned(const std::string &key, const std::string &value) const;
+diff --git a/Controller.cpp b/Controller.cpp
+index 75cd0b0..3035a81 100644
+--- a/Controller.cpp
++++ b/Controller.cpp
+@@ -44,6 +44,7 @@ bool CController::Start()
+ 	usrp_rx_num = calcNumerator(g_Conf.GetGain(EGainType::usrprx));
+ 	usrp_tx_num = calcNumerator(g_Conf.GetGain(EGainType::usrptx));
+ 
++	tcClient.SetFraming(g_Conf.GetFraming());
+ 	if (InitVocoders() || tcClient.Open(g_Conf.GetAddress(), g_Conf.GetTCMods(), g_Conf.GetPort()))
+ 	{
+ 		keep_running = false;
+diff --git a/TCFraming.cpp b/TCFraming.cpp
+new file mode 100644
+index 0000000..1c38ffa
+--- /dev/null
++++ b/TCFraming.cpp
+@@ -0,0 +1,164 @@
++// Optional v2 framing for the reflector <-> tcd link. See TCFraming.h.
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++#include <cstring>
++#include <algorithm>
++
++#include "TCFraming.h"
++
++uint32_t Crc32Ieee(const uint8_t *data, std::size_t len)
++{
++	static uint32_t table[256];
++	static bool ready = false;
++	if (! ready)
++	{
++		for (uint32_t i = 0; i < 256; i++)
++		{
++			uint32_t c = i;
++			for (int k = 0; k < 8; k++)
++				c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
++			table[i] = c;
++		}
++		ready = true;
++	}
++	uint32_t crc = 0xFFFFFFFFu;
++	for (std::size_t i = 0; i < len; i++)
++		crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
++	return crc ^ 0xFFFFFFFFu;
++}
++
++void EncodeV2Frame(const STCPacket &packet, uint8_t *out)
++{
++	memcpy(out, kV2Magic, 4);
++	out[4] = kV2Version;
++	out[5] = 0;
++	out[6] = uint8_t(TCPacketWireSize & 0xFF);
++	out[7] = uint8_t(TCPacketWireSize >> 8);
++	EncodeTCPacket(packet, out + kV2HeaderSize);
++	const uint32_t crc = Crc32Ieee(out + 4, 4 + TCPacketWireSize);
++	uint8_t *t = out + kV2HeaderSize + TCPacketWireSize;
++	t[0] = uint8_t(crc);
++	t[1] = uint8_t(crc >> 8);
++	t[2] = uint8_t(crc >> 16);
++	t[3] = uint8_t(crc >> 24);
++}
++
++void CV2Reader::Reset()
++{
++	m_Buf.clear();
++	m_Start = 0;
++	m_InGarbage = false;
++	m_BadRun = 0;
++	m_Skipped = 0;
++}
++
++void CV2Reader::Append(const uint8_t *data, std::size_t len)
++{
++	if (m_Start > 0 && m_Start >= m_Buf.size() / 2)
++	{
++		m_Buf.erase(m_Buf.begin(), m_Buf.begin() + m_Start);
++		m_Start = 0;
++	}
++	m_Buf.insert(m_Buf.end(), data, data + len);
++}
++
++void CV2Reader::drop(std::size_t n)
++{
++	m_Start += n;
++	if (m_Start >= m_Buf.size())
++	{
++		m_Buf.clear();
++		m_Start = 0;
++	}
++}
++
++EV2Status CV2Reader::bad(const char *reason, const char *&why)
++{
++	why = reason;
++	m_BadRun++;
++	m_BadTotal++;
++	// The bytes after a bad frame are not in a frame either; do not count
++	// them again as a separate run of garbage.
++	m_InGarbage = true;
++	return (m_BadRun >= kV2MaxBadRun) ? EV2Status::too_many_bad : EV2Status::bad;
++}
++
++EV2Status CV2Reader::RefusePacket(const char *&why)
++{
++	return bad(why, why);
++}
++
++EV2Status CV2Reader::Next(STCPacket &packet, const char *&why)
++{
++	why = nullptr;
++	for (;;)
++	{
++		const uint8_t *p = m_Buf.data() + m_Start;
++		const std::size_t avail = m_Buf.size() - m_Start;
++		if (avail < 4)
++			return EV2Status::need_more;
++
++		// find the magic
++		const uint8_t *m = std::search(p, p + avail, kV2Magic, kV2Magic + 4);
++		std::size_t off = std::size_t(m - p);
++		if (off > 0)
++		{
++			// Bytes outside a frame. Keep a tail that can be the start
++			// of a magic that is not complete yet.
++			std::size_t skip = (m == p + avail) ? avail - 3 : off;
++			drop(skip);
++			m_Skipped += skip;
++			if (m_Skipped > kV2MaxGarbage)
++			{
++				why = "too many bytes outside a frame";
++				return EV2Status::too_many_bad;
++			}
++			if (! m_InGarbage)
++				return bad("bytes outside a frame", why);
++			if (m == p + avail)
++				return EV2Status::need_more;
++			continue;
++		}
++
++		// a magic at the start of the buffer
++		if (avail < kV2HeaderSize)
++			return EV2Status::need_more;
++		if (p[4] != kV2Version)
++		{
++			drop(1);
++			m_Skipped++;
++			return bad("unknown frame version", why);
++		}
++		const std::size_t plen = std::size_t(p[6]) | (std::size_t(p[7]) << 8);
++		if (plen < kV2MinPayload || plen > kV2MaxPayload)
++		{
++			drop(1);
++			m_Skipped++;
++			return bad("frame length out of range", why);
++		}
++		const std::size_t total = kV2HeaderSize + plen + kV2TrailerSize;
++		if (avail < total)
++			return EV2Status::need_more;
++		const uint8_t *t = p + kV2HeaderSize + plen;
++		const uint32_t got = uint32_t(t[0]) | (uint32_t(t[1]) << 8) | (uint32_t(t[2]) << 16) | (uint32_t(t[3]) << 24);
++		if (got != Crc32Ieee(p + 4, 4 + plen))
++		{
++			drop(1);
++			m_Skipped++;
++			return bad("frame CRC mismatch", why);
++		}
++		const char *reason = DecodeTCPacket(p + kV2HeaderSize, packet);
++		drop(total);
++		if (reason)
++			return bad(reason, why);
++		m_InGarbage = false;
++		m_BadRun = 0;
++		m_Skipped = 0;
++		m_Good++;
++		return EV2Status::packet;
++	}
++}
+diff --git a/TCFraming.h b/TCFraming.h
+new file mode 100644
+index 0000000..c54907a
+--- /dev/null
++++ b/TCFraming.h
+@@ -0,0 +1,84 @@
++#pragma once
++
++// Optional "v2" framing for the reflector <-> tcd link.
++//
++// Why: with raw framing the link is a plain run of 376-byte packets. One
++// lost, extra or changed byte puts every later packet out of step, and
++// the only cure is to drop the link. v2 wraps each packet in a frame with
++// a magic, a version, a length and a CRC, so a reader can find the next
++// good frame and go on. v2 is off by default (tcd.ini: Framing = raw), so
++// an unchanged reflector keeps working. Both ends must use the same mode.
++//
++// Connection: tcd still sends its one module-letter byte first, without
++// a frame. After that byte every packet in both directions, pings too,
++// is one v2 frame:
++//
++//   0  4  magic "TCD2" (0x54 0x43 0x44 0x32)
++//   4  1  version, 1
++//   5  1  flags, 0 (ignored on read)
++//   6  2  payload length, u16 little-endian (376 for this version;
++//         a reader accepts 376..1024 and ignores bytes after 376)
++//   8  n  payload: the packet in the explicit encoding of TCPacketCodec.h
++// 8+n 4  CRC-32 (IEEE 802.3, as zlib crc32) of bytes 4..8+n-1, u32 LE
++//
++// A reader that finds a bad frame (bad version, length or CRC, or bytes
++// that are not in a frame) counts it, skips forward to the next magic
++// and goes on. It drops the link only after kV2MaxBadRun bad frames with
++// no good frame between them.
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++#include "TCPacketDef.h"
++#include "TCPacketCodec.h"
++
++enum class EFraming { raw, v2 };
++
++constexpr uint8_t     kV2Magic[4]      = { 'T', 'C', 'D', '2' };
++constexpr uint8_t     kV2Version       = 1;
++constexpr std::size_t kV2HeaderSize    = 8;
++constexpr std::size_t kV2TrailerSize   = 4;
++constexpr std::size_t kV2MinPayload    = TCPacketWireSize;
++constexpr std::size_t kV2MaxPayload    = 1024;
++constexpr std::size_t kV2FrameSize     = kV2HeaderSize + TCPacketWireSize + kV2TrailerSize; // 388
++constexpr unsigned    kV2MaxBadRun     = 8;
++constexpr std::size_t kV2MaxGarbage    = 64 * 1024;
++
++// CRC-32/IEEE (reflected 0xEDB88320, init and final XOR 0xFFFFFFFF).
++uint32_t Crc32Ieee(const uint8_t *data, std::size_t len);
++
++// Write one v2 frame for packet to out (kV2FrameSize bytes).
++void EncodeV2Frame(const STCPacket &packet, uint8_t *out);
++
++enum class EV2Status { packet, need_more, bad, too_many_bad };
++
++// Reassembles v2 frames from a byte stream.
++class CV2Reader
++{
++public:
++	void Reset();
++	void Append(const uint8_t *data, std::size_t len);
++	// Gets the next result. On EV2Status::bad and too_many_bad, why says
++	// what was wrong. Call again until need_more.
++	EV2Status Next(STCPacket &packet, const char *&why);
++	// Counts a well-formed frame whose content the caller refused.
++	EV2Status RefusePacket(const char *&why);
++
++	unsigned BadRun() const { return m_BadRun; }
++	unsigned long BadTotal() const { return m_BadTotal; }
++	unsigned long Good() const { return m_Good; }
++	std::size_t Skipped() const { return m_Skipped; }
++
++private:
++	EV2Status bad(const char *reason, const char *&why);
++	void drop(std::size_t n);
++
++	std::vector<uint8_t> m_Buf;
++	std::size_t m_Start = 0;
++	bool m_InGarbage = false;
++	unsigned m_BadRun = 0;
++	unsigned long m_BadTotal = 0;
++	unsigned long m_Good = 0;
++	std::size_t m_Skipped = 0;      // bytes skipped since the last good frame
++};
+diff --git a/TCSocket.cpp b/TCSocket.cpp
+index 562e84e..9a657ea 100644
+--- a/TCSocket.cpp
++++ b/TCSocket.cpp
+@@ -78,6 +78,9 @@ void CTCSocket::Close(int fd)
+ 				perror("close");
+ 			}
+ 			p.fd = -1;
++			const auto slot = &p - m_Pfd.data();
++			if (slot >= 0 && std::size_t(slot) < m_Rx.size())
++				m_Rx[slot].Reset();
+ 			return;
+ 		}
+ 	}
+@@ -132,13 +135,20 @@ bool CTCSocket::Send(const STCPacket *packet)
+ 	if (m_Pfd[pos].fd < 0)
+ 		return true; // not connected; the caller reconnects
+ 
+-	uint8_t data[TCPacketWireSize];
+-	EncodeTCPacket(*packet, data);
++	uint8_t data[kV2FrameSize];
++	std::size_t size = TCPacketWireSize;
++	if (EFraming::v2 == m_Framing)
++	{
++		EncodeV2Frame(*packet, data);
++		size = kV2FrameSize;
++	}
++	else
++		EncodeTCPacket(*packet, data);
+ 	unsigned count = 0;
+ 	do {
+ 		// MSG_NOSIGNAL: a peer that closed must give EPIPE, not a SIGPIPE
+ 		// that ends the whole process.
+-		auto n = send(m_Pfd[pos].fd, data+count, TCPacketWireSize-count, MSG_NOSIGNAL);
++		auto n = send(m_Pfd[pos].fd, data+count, size-count, MSG_NOSIGNAL);
+ 		if (n < 0 && EINTR == errno)
+ 			continue;
+ 		if (n <= 0)
+@@ -155,7 +165,7 @@ bool CTCSocket::Send(const STCPacket *packet)
+ 			return true;
+ 		}
+ 		count += n;
+-	} while (count < TCPacketWireSize);
++	} while (count < size);
+ 	return false;
+ }
+ 
+@@ -200,6 +210,79 @@ bool CTCSocket::receive(int fd, STCPacket *packet)
+ 	return false;
+ }
+ 
++int CTCSocket::slotOf(int fd) const
++{
++	for (unsigned i=0; i<m_Pfd.size(); i++)
++		if (fd == m_Pfd[i].fd)
++			return int(i);
++	return -1;
++}
++
++// v2 framing: read what is there, then take every complete frame out of
++// the reassembly buffer. A bad frame is counted and skipped; the link is
++// closed only after kV2MaxBadRun bad frames in a row. The first bad
++// frame of a burst is logged, and so is the recovery.
++void CTCSocket::receiveV2(int fd, std::queue<std::unique_ptr<STCPacket>> &queue)
++{
++	const int slot = slotOf(fd);
++	if (slot < 0 || std::size_t(slot) >= m_Rx.size())
++	{
++		Close(fd);
++		return;
++	}
++	uint8_t buf[4096];
++	ssize_t n;
++	do {
++		n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
++	} while (n < 0 && EINTR == errno);
++	if (n < 0 && (EAGAIN == errno || EWOULDBLOCK == errno))
++		return;
++	if (n <= 0)
++	{
++		if (n < 0)
++			perror("receiveV2 recv");
++		Close(fd);
++		return;
++	}
++	auto &rx = m_Rx[slot];
++	rx.Append(buf, std::size_t(n));
++	const char mod = m_Modules[slot];
++	for (;;)
++	{
++		auto p = std::make_unique<STCPacket>();
++		const char *why = nullptr;
++		const unsigned badBefore = rx.BadRun();
++		const std::size_t skippedBefore = rx.Skipped();
++		auto st = rx.Next(*p, why);
++		if (EV2Status::need_more == st)
++			return;
++		if (EV2Status::packet == st)
++		{
++			if (badBefore > 0)
++				std::cerr << "Module '" << mod << "': v2 link in step again after " << badBefore << " bad frame(s), " << skippedBefore << " byte(s) skipped" << std::endl;
++			if (ECodecType::ping != p->codec_in && p->module != mod)
++			{
++				why = "packet names another module";
++				st = rx.RefusePacket(why);
++			}
++			else
++			{
++				if (ECodecType::ping != p->codec_in)
++					queue.push(std::move(p));
++				continue;
++			}
++		}
++		if (1 == rx.BadRun() || EV2Status::too_many_bad == st)
++			std::cerr << "Module '" << mod << "': bad v2 frame: " << why << " (" << rx.BadTotal() << " bad so far)" << std::endl;
++		if (EV2Status::too_many_bad == st)
++		{
++			std::cerr << "Module '" << mod << "': " << rx.BadRun() << " bad v2 frames in a row, closing the link" << std::endl;
++			Close(fd);
++			return;
++		}
++	}
++}
++
+ // A packet on the link of one module must name that module. A ping
+ // carries no data and is not checked. Logs the first mismatch on each
+ // module and then every 100th, so a broken peer cannot flood the log.
+@@ -276,6 +359,11 @@ bool CTCServer::Receive(char module, STCPacket *packet, int ms)
+ 
+ bool CTCServer::Open(const std::string &address, const std::string &modules, uint16_t port)
+ {
++	if (EFraming::v2 == m_Framing)
++	{
++		std::cerr << "CTCServer: v2 framing is not implemented on the reflector side" << std::endl;
++		return true;
++	}
+ 	m_Modules.assign(modules);
+ 
+ 	m_Ip = CIp(address.c_str(), AF_UNSPEC, SOCK_STREAM, port);
+@@ -412,8 +500,9 @@ bool CTCClient::Open(const std::string &address, const std::string &modules, uin
+ 		pf.fd = -1;
+ 		pf.events = POLLIN;
+ 	}
++	m_Rx.assign(m_Modules.size(), CV2Reader());
+ 
+-	std::cout << "Connecting to the TCP server..." << std::endl;
++	std::cout << "Connecting to the TCP server" << (EFraming::v2 == m_Framing ? " (v2 framing)" : "") << "..." << std::endl;
+ 
+ 	for (char c : modules)
+ 	{
+@@ -487,6 +576,8 @@ bool CTCClient::Connect(char module)
+ 	std::cout << "File descriptor " << fd << " on " << ip << " opened for module '" << module << "'" << std::endl;
+ 
+ 	m_Pfd[pos].fd = fd;
++	if (pos < m_Rx.size())
++		m_Rx[pos].Reset();
+ 
+ 	return false;
+ }
+@@ -542,7 +633,11 @@ void CTCClient::Receive(std::queue<std::unique_ptr<STCPacket>> &queue, int ms)
+ 		if (pfd.fd < 0)
+ 			continue;
+ 
+-		if (pfd.revents & POLLIN)
++		if ((pfd.revents & POLLIN) && EFraming::v2 == m_Framing)
++		{
++			receiveV2(pfd.fd, queue);
++		}
++		else if (pfd.revents & POLLIN)
+ 		{
+ 			auto p_tcpack = std::make_unique<STCPacket>();
+ 			if (receive(pfd.fd, p_tcpack.get()))
+diff --git a/TCSocket.h b/TCSocket.h
+index 93c29b0..1b7cef9 100644
+--- a/TCSocket.h
++++ b/TCSocket.h
+@@ -26,6 +26,7 @@
+ 
+ #include "IP.h"
+ #include "TCPacketDef.h"
++#include "TCFraming.h"
+ 
+ class CTCSocket
+ {
+@@ -38,6 +39,10 @@ public:
+ 	void Close(char module); // close a specific module
+ 	void Close(int fd); // close a specific file descriptor
+ 
++	// Raw (default) or v2 framing; see TCFraming.h. Set before Open().
++	void SetFraming(EFraming framing) { m_Framing = framing; }
++	EFraming GetFraming() const { return m_Framing; }
++
+ 	// All bool functions, except Server Receive, return true if there was an error
+ 	bool Send(const STCPacket *packet);
+ 
+@@ -48,6 +53,10 @@ protected:
+ 	bool receive(int fd, STCPacket *packet);
+ 	bool moduleMatches(int fd, const STCPacket &packet);
+ 	unsigned long m_BadModule = 0;
++	EFraming m_Framing = EFraming::raw;
++	std::vector<CV2Reader> m_Rx; // one per module, v2 framing only
++	int slotOf(int fd) const;
++	void receiveV2(int fd, std::queue<std::unique_ptr<STCPacket>> &queue);
+ 	std::vector<struct pollfd> m_Pfd;
+ 	std::string m_Modules;
+ };
+diff --git a/config/tcd.ini b/config/tcd.ini
+index 5758c86..10055ae 100644
+--- a/config/tcd.ini
++++ b/config/tcd.ini
+@@ -8,6 +8,11 @@ ServerAddress = 127.0.0.1
+ # This will either be a single module (for DVSI-3000), or up to three modules (for DVSI-3003).
+ Modules = A
+ 
++# Link framing: raw (default, the plain STCPacket stream that every
++# reflector understands) or v2 (each packet in a frame with a CRC; the
++# reflector must use v2 too). See TCFraming.h.
++#Framing = raw
++
+ 
+ # All gain values are in dB.
+ # Gain values are limited to -24 to +24. Typical values will usually be less.

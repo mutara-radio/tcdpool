@@ -1,0 +1,407 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:26:19 -0400
+Subject: [PATCH 11/11] Controller: transcode only the requested outputs
+
+tcd decoded every packet and then encoded it into every codec, also when
+the reflector needed only one of them. For software vocoders this costs
+CPU on each 20 ms frame and adds latency, because the reply waits for
+the slowest encoder.
+
+Each packet now has a requested-outputs mask (see TCPacketDef.h):
+
+- A v2 packet gives the mask in its frame header. 0 means all codecs,
+  which is the upstream behaviour.
+- A raw packet cannot give a mask. It gets the new tcd.ini key
+  DefaultOutputs, which is "all" when it is not set. So a raw link works
+  as before.
+
+With the mask:
+
+- When the only requested output is the input codec, tcd sends the
+  reply at once, with no decode.
+- Otherwise the input is decoded to audio once, and the audio goes only
+  to the encoder queues of the requested outputs.
+- The reply goes out when the requested fields are set.
+- Every field that was not requested is zero in the reply, the input
+  field too. The v2 reply header gives the mask of the filled fields.
+
+CTranscoderPacket now zero-initializes its packet and audio, so no
+uninitialized memory can go into a reply.
+
+Note: codec2 3200 output puts two 20 ms frames in one m17 field, and
+the odd frame takes its first half from the even frame. A reflector
+that wants m17 output must request it for both frames of a pair.
+Encoders and decoders keep state from frame to frame, so a stream must
+keep the same mask for the best audio.
+---
+ Configure.cpp        | 46 +++++++++++++++++++++++++++++++
+ Configure.h          |  4 +++
+ Controller.cpp       | 65 ++++++++++++++++++++++++++++----------------
+ Controller.h         |  1 +
+ TCPacketDef.h        | 16 +++++++++++
+ TranscoderPacket.cpp | 24 ++++++++++++++--
+ TranscoderPacket.h   | 17 ++++++++++--
+ config/tcd.ini       |  6 ++++
+ 8 files changed, 151 insertions(+), 28 deletions(-)
+
+diff --git a/Configure.cpp b/Configure.cpp
+index dce34ed..6a54073 100644
+--- a/Configure.cpp
++++ b/Configure.cpp
+@@ -35,6 +35,7 @@
+ #define SERVERADDRESS  "ServerAddress"
+ #define PORT           "Port"
+ #define FRAMING        "Framing"
++#define DEFAULTOUTPUTS "DefaultOutputs"
+ 
+ static inline void split(const std::string &s, char delim, std::vector<std::string> &v)
+ {
+@@ -131,6 +132,11 @@ bool CConfigure::ReadData(const std::string &path)
+ 				return true;
+ 			}
+ 		}
++		else if (0 == key.compare(DEFAULTOUTPUTS))
++		{
++			if (parseOutputs(value))
++				return true;
++		}
+ 		else if (0 == key.compare(DSTARGAININ))
+ 			dstar_in = getSigned(key, value);
+ 		else if (0 == key.compare(DSTARGAINOUT))
+@@ -181,6 +187,7 @@ bool CConfigure::ReadData(const std::string &path)
+ 	std::cout << SERVERADDRESS << " = " << address << std::endl;
+ 	std::cout << PORT << " = " << port << std::endl;
+ 	std::cout << FRAMING << " = " << (EFraming::v2 == framing ? "v2" : "raw") << std::endl;
++	std::cout << DEFAULTOUTPUTS << " = 0x" << std::hex << unsigned(default_outputs) << std::dec << std::endl;
+ 	std::cout << DSTARGAININ << " = " << dstar_in << std::endl;
+ 	std::cout << DSTARGAINOUT << " = " << dstar_out << std::endl;
+ 	std::cout << DMRGAININ << " = " << dmr_in << std::endl;
+@@ -191,6 +198,45 @@ bool CConfigure::ReadData(const std::string &path)
+ 	return false;
+ }
+ 
++// DefaultOutputs: "all", or a list of dstar, dmr, m17, p25 and usrp,
++// separated by commas or spaces. Returns true on failure.
++bool CConfigure::parseOutputs(const std::string &value)
++{
++	std::string v(value);
++	std::transform(v.begin(), v.end(), v.begin(), ::tolower);
++	std::replace(v.begin(), v.end(), ',', ' ');
++	std::istringstream iss(v);
++	std::string name;
++	uint8_t m = 0;
++	while (iss >> name)
++	{
++		if (name == "all")
++			m |= kTCOutAll;
++		else if (name == "dstar")
++			m |= TCOut(ECodecType::dstar);
++		else if (name == "dmr")
++			m |= TCOut(ECodecType::dmr);
++		else if (name == "m17")
++			m |= TCOut(ECodecType::c2_3200);
++		else if (name == "p25")
++			m |= TCOut(ECodecType::p25);
++		else if (name == "usrp")
++			m |= TCOut(ECodecType::usrp);
++		else
++		{
++			std::cerr << "ERROR: " << DEFAULTOUTPUTS << ": unknown output '" << name << "' (use all, dstar, dmr, m17, p25, usrp). Halt." << std::endl;
++			return true;
++		}
++	}
++	if (0 == m)
++	{
++		std::cerr << "ERROR: " << DEFAULTOUTPUTS << " is empty. Halt." << std::endl;
++		return true;
++	}
++	default_outputs = m;
++	return false;
++}
++
+ int CConfigure::getSigned(const std::string &key, const std::string &value) const
+ {
+ 	auto i = std::stoi(value.c_str());
+diff --git a/Configure.h b/Configure.h
+index 2ad9f42..db8c39b 100644
+--- a/Configure.h
++++ b/Configure.h
+@@ -37,12 +37,16 @@ public:
+ 	std::string GetAddress(void) const { return address; }
+ 	unsigned GetPort(void) const { return port; }
+ 	EFraming GetFraming(void) const { return framing; }
++	// requested-outputs mask for a packet that gives none (raw framing)
++	uint8_t GetDefaultOutputs(void) const { return default_outputs; }
+ 
+ private:
+ 	// CFGDATA data;
+ 	std::string tcmods, address;
+ 	uint16_t port;
+ 	EFraming framing = EFraming::raw;
++	uint8_t default_outputs = kTCOutAll;
++	bool parseOutputs(const std::string &value);
+ 	int dstar_in, dstar_out, dmr_in, dmr_out, usrp_tx, usrp_rx;
+ 
+ 	int getSigned(const std::string &key, const std::string &value) const;
+diff --git a/Controller.cpp b/Controller.cpp
+index 877f9f0..1cc23d3 100644
+--- a/Controller.cpp
++++ b/Controller.cpp
+@@ -105,8 +105,21 @@ void CController::ReadReflectorThread()
+ 		{
+ 			// create a shared pointer to a new packet
+ 			// there is only one CTranscoderPacket created for each new STCPacket received from the reflector
+-			auto packet = std::make_shared<CTranscoderPacket>(queue.front()->packet);
++			// A v2 packet says which codecs the reflector wants; 0 is all.
++			// A raw packet cannot say, so it gets DefaultOutputs.
++			uint8_t outputs = queue.front()->outputs;
++			if (EFraming::raw == g_Conf.GetFraming())
++				outputs = g_Conf.GetDefaultOutputs();
++			auto packet = std::make_shared<CTranscoderPacket>(queue.front()->packet, outputs);
+ 			queue.pop();
++			if (0 == packet->Needed())
++			{
++				// nothing to transcode: reply with the input only
++				send_mux.lock();
++				SendToReflector(packet);
++				send_mux.unlock();
++				continue;
++			}
+ 			switch (packet->GetCodecIn())
+ 			{
+ 			case ECodecType::dstar:
+@@ -214,10 +227,7 @@ void CController::Codec2toAudio(std::shared_ptr<CTranscoderPacket> packet)
+ 	// here, on the codec2 thread, at the same time as the AMBE, AMBE+2
+ 	// and IMBE threads used the same vocoder objects, and it never sent
+ 	// the reply, so a codec2 input packet was never answered.
+-	ambe_queue.push(packet);
+-	swambe2_queue.push(packet);
+-	imbe_queue.push(packet);
+-	usrp_queue.push(packet);
++	Route(packet);
+ }
+ 
+ void CController::ProcessC2Thread()
+@@ -280,10 +290,7 @@ void CController::AMBEtoAudio(std::shared_ptr<CTranscoderPacket> packet)
+ 			tmp[i] = (tmp[i] * dstar_out_num) >> 8;
+ 	}
+ 	packet->SetAudioSamples(tmp, false);
+-	codec2_queue.push(packet);
+-	swambe2_queue.push(packet);
+-	imbe_queue.push(packet);
+-	usrp_queue.push(packet);
++	Route(packet);
+ }
+ 
+ void CController::ProcessAMBEThread()
+@@ -343,10 +350,7 @@ void CController::SWAMBE2toAudio(std::shared_ptr<CTranscoderPacket> packet)
+ 			tmp[i] = (tmp[i] * ambe_out_num) >> 8;
+ 	}
+ 	packet->SetAudioSamples(tmp, false);
+-	codec2_queue.push(packet);
+-	imbe_queue.push(packet);
+-	ambe_queue.push(packet);
+-	usrp_queue.push(packet);
++	Route(packet);
+ }
+ 
+ void CController::ProcessSWAMBE2Thread()
+@@ -389,10 +393,7 @@ void CController::IMBEtoAudio(std::shared_ptr<CTranscoderPacket> packet)
+ 	int16_t tmp[160] = { 0 };
+ 	p25vocoder.decode_4400(tmp, (uint8_t*)packet->GetP25Data());
+ 	packet->SetAudioSamples(tmp, false);
+-	ambe_queue.push(packet);
+-	codec2_queue.push(packet);
+-	swambe2_queue.push(packet);
+-	usrp_queue.push(packet);
++	Route(packet);
+ }
+ 
+ void CController::ProcessIMBEThread()
+@@ -452,11 +453,8 @@ void CController::USRPtoAudio(std::shared_ptr<CTranscoderPacket> packet)
+ 	}
+ 	else
+ 		packet->SetAudioSamples(p, false);
+-		
+-	codec2_queue.push(packet);
+-	ambe_queue.push(packet);
+-	swambe2_queue.push(packet);
+-	imbe_queue.push(packet);
++
++	Route(packet);
+ }
+ 
+ void CController::ProcessUSRPThread()
+@@ -482,10 +480,31 @@ void CController::ProcessUSRPThread()
+ 	}
+ }
+ 
++// The input was decoded to audio. Give the audio to the encoder of
++// each requested output, and to no other encoder. The field of the
++// input codec is already set, so its own queue gets nothing.
++void CController::Route(std::shared_ptr<CTranscoderPacket> packet)
++{
++	const uint8_t need = packet->Needed();
++	if (need & TCOut(ECodecType::c2_3200))
++		codec2_queue.push(packet);
++	if (need & TCOut(ECodecType::dstar))
++		ambe_queue.push(packet);
++	if (need & TCOut(ECodecType::dmr))
++		swambe2_queue.push(packet);
++	if (need & TCOut(ECodecType::p25))
++		imbe_queue.push(packet);
++	if (need & TCOut(ECodecType::usrp))
++		usrp_queue.push(packet);
++}
++
++// Send the reply: the requested fields, every other field zero. The
++// v2 header tells the reflector which fields hold data.
+ void CController::SendToReflector(std::shared_ptr<CTranscoderPacket> packet)
+ {
++	const STCPacket reply = packet->Reply();
+ 	// send the packet over the socket
+-	while (tcClient.Send(packet->GetTCPacket()))
++	while (tcClient.Send(&reply, packet->Want()))
+ 	{
+ 		tcClient.ReConnect();
+ 	}
+diff --git a/Controller.h b/Controller.h
+index 2bf7998..ec49715 100644
+--- a/Controller.h
++++ b/Controller.h
+@@ -78,6 +78,7 @@ protected:
+ 	void USRPtoAudio(std::shared_ptr<CTranscoderPacket> packet);
+ 	void AudiotoUSRP(std::shared_ptr<CTranscoderPacket> packet);
+ 	void SendToReflector(std::shared_ptr<CTranscoderPacket> packet);
++	void Route(std::shared_ptr<CTranscoderPacket> packet);
+     void SWAMBE2toAudio(std::shared_ptr<CTranscoderPacket> packet);
+     void AudiotoSWAMBE2(std::shared_ptr<CTranscoderPacket> packet);
+ };
+diff --git a/TCPacketDef.h b/TCPacketDef.h
+index 626f87e..3bd600c 100644
+--- a/TCPacketDef.h
++++ b/TCPacketDef.h
+@@ -28,6 +28,22 @@ enum class ECodecType : std::uint8_t { none = 0, dstar = 1, dmr = 2, c2_1600 = 3
+ constexpr uint8_t TCOut(ECodecType c) { return uint8_t(1u << unsigned(c)); }
+ constexpr uint8_t kTCOutAll = TCOut(ECodecType::dstar) | TCOut(ECodecType::dmr) | TCOut(ECodecType::c2_3200) | TCOut(ECodecType::p25) | TCOut(ECodecType::usrp);
+ 
++// The output bit of an input codec: codec2 input fills the m17 field.
++constexpr uint8_t TCOutOfInput(ECodecType c)
++{
++	return (ECodecType::c2_1600 == c) ? TCOut(ECodecType::c2_3200) : TCOut(c);
++}
++
++// Make a requested mask usable: the c2_1600 bit selects the m17 field,
++// unknown bits are dropped, and a mask with no known bit means all.
++constexpr uint8_t TCOutNormalize(uint8_t m)
++{
++	if (m & TCOut(ECodecType::c2_1600))
++		m |= TCOut(ECodecType::c2_3200);
++	m &= kTCOutAll;
++	return m ? m : kTCOutAll;
++}
++
+ using STCPacket = struct tcpacket_tag {
+ 	uint32_t sequence;
+ 	char module;
+diff --git a/TranscoderPacket.cpp b/TranscoderPacket.cpp
+index 97414d7..9c4d7ea 100644
+--- a/TranscoderPacket.cpp
++++ b/TranscoderPacket.cpp
+@@ -19,7 +19,7 @@
+ 
+ #include "TranscoderPacket.h"
+ 
+-CTranscoderPacket::CTranscoderPacket(const STCPacket &tcp) : dstar_set(false), dmr_set(false), p25_set(false), m17_set(false), usrp_set(false), not_sent(true)
++CTranscoderPacket::CTranscoderPacket(const STCPacket &tcp, uint8_t outputs) : want(TCOutNormalize(outputs)), dstar_set(false), dmr_set(false), p25_set(false), m17_set(false), usrp_set(false), not_sent(true)
+ {
+ 	tcpacket.module = tcp.module;
+ 	tcpacket.is_last = tcp.is_last;
+@@ -186,7 +186,27 @@ bool CTranscoderPacket::AllCodecsAreSet()
+ 	dmr_set = true;
+ #endif
+ #endif
+-	return (dstar_set && dmr_set && m17_set && p25_set && usrp_set);
++	return (dstar_set || ! Wants(ECodecType::dstar)) &&
++	       (dmr_set   || ! Wants(ECodecType::dmr)) &&
++	       (m17_set   || ! Wants(ECodecType::c2_3200)) &&
++	       (p25_set   || ! Wants(ECodecType::p25)) &&
++	       (usrp_set  || ! Wants(ECodecType::usrp));
++}
++
++STCPacket CTranscoderPacket::Reply() const
++{
++	STCPacket r = tcpacket;
++	if (! Wants(ECodecType::dstar))
++		memset(r.dstar, 0, sizeof(r.dstar));
++	if (! Wants(ECodecType::dmr))
++		memset(r.dmr, 0, sizeof(r.dmr));
++	if (! Wants(ECodecType::c2_3200))
++		memset(r.m17, 0, sizeof(r.m17));
++	if (! Wants(ECodecType::p25))
++		memset(r.p25, 0, sizeof(r.p25));
++	if (! Wants(ECodecType::usrp))
++		memset(r.usrp, 0, sizeof(r.usrp));
++	return r;
+ }
+ 
+ void CTranscoderPacket::Sent()
+diff --git a/TranscoderPacket.h b/TranscoderPacket.h
+index 4a49b40..4052bff 100644
+--- a/TranscoderPacket.h
++++ b/TranscoderPacket.h
+@@ -27,7 +27,8 @@ class CTranscoderPacket
+ {
+ public:
+ 	// constructor
+-	CTranscoderPacket(const STCPacket &tcp);
++	// outputs is the requested-outputs mask (see TCPacketDef.h), 0 = all.
++	CTranscoderPacket(const STCPacket &tcp, uint8_t outputs = 0);
+ 
+ 	// this packet's refector module;
+ 	char GetModule() const;
+@@ -60,6 +61,15 @@ public:
+ 	bool M17IsSet() const;
+ 	bool USRPIsSet() const;
+ 	bool AllCodecsAreSet();
++	// requested outputs (normalized, never 0)
++	uint8_t Want() const { return want; }
++	bool Wants(ECodecType c) const { return 0 != (want & TCOut(c)); }
++	// requested outputs that must be made from audio: all except the
++	// field of the input codec, which is already set
++	uint8_t Needed() const { return uint8_t(want & ~TCOutOfInput(tcpacket.codec_in)); }
++	// the reply: a copy of the packet with every field that was not
++	// requested set to zero
++	STCPacket Reply() const;
+ 	void Sent();
+ 	bool HasNotBeenSent() const;
+ 
+@@ -67,7 +77,8 @@ public:
+ 	const STCPacket *GetTCPacket() const;
+ 
+ private:
+-	STCPacket tcpacket;
+-	int16_t audio[160];
++	STCPacket tcpacket{};
++	int16_t audio[160]{};
++	uint8_t want;
+ 	std::atomic_bool dstar_set, dmr_set, p25_set, m17_set, usrp_set, not_sent;
+ };
+diff --git a/config/tcd.ini b/config/tcd.ini
+index 10055ae..ef022a8 100644
+--- a/config/tcd.ini
++++ b/config/tcd.ini
+@@ -13,6 +13,12 @@ Modules = A
+ # reflector must use v2 too). See TCFraming.h.
+ #Framing = raw
+ 
++# The codecs that tcd makes for a packet that does not say which it
++# wants (all packets on a raw link). "all" (default), or a list of
++# dstar, dmr, m17, p25 and usrp. Do not change it for a reflector that
++# uses the codecs you leave out. A v2 packet carries its own list.
++#DefaultOutputs = all
++
+ 
+ # All gain values are in dB.
+ # Gain values are limited to -24 to +24. Typical values will usually be less.

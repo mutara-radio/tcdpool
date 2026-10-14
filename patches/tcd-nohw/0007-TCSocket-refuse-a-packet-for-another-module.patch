@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:11:55 -0400
+Subject: [PATCH 07/11] TCSocket: refuse a packet for another module
+
+Each module has its own TCP link, but the module byte inside a
+received packet was never checked. A packet with a letter that is not
+configured went through the vocoders, and then Send() refused the
+reply ('unconfigured module'), so SendToReflector() looped forever on
+Send()/ReConnect() while it held send_mux: the transcoder stopped for
+every module.
+
+Check that a received packet names the module of its link. On a
+mismatch, do not process the packet, close the link and let the
+normal reconnect start again. Log the first mismatch and then every
+100th. Pings are not checked, because a ping has no module data.
+
+The client side also no longer queues a received ping as work; before
+this the controller printed 'unknown Codec' for each ping.
+---
+ TCSocket.cpp | 26 +++++++++++++++++++++++++-
+ TCSocket.h   |  2 ++
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/TCSocket.cpp b/TCSocket.cpp
+index c3d7908..562e84e 100644
+--- a/TCSocket.cpp
++++ b/TCSocket.cpp
+@@ -200,6 +200,21 @@ bool CTCSocket::receive(int fd, STCPacket *packet)
+ 	return false;
+ }
+ 
++// A packet on the link of one module must name that module. A ping
++// carries no data and is not checked. Logs the first mismatch on each
++// module and then every 100th, so a broken peer cannot flood the log.
++bool CTCSocket::moduleMatches(int fd, const STCPacket &packet)
++{
++	if (ECodecType::ping == packet.codec_in)
++		return true;
++	const char mod = GetMod(fd);
++	if (packet.module == mod)
++		return true;
++	if (0 == m_BadModule++ % 100)
++		std::cerr << "Packet for module '" << packet.module << "' (0x" << std::hex << unsigned((unsigned char)packet.module) << std::dec << ") arrived on the link of module '" << mod << "', closing the link (" << m_BadModule << " so far)" << std::endl;
++	return false;
++}
++
+ // returns true if there is data to return
+ bool CTCServer::Receive(char module, STCPacket *packet, int ms)
+ {
+@@ -231,6 +246,8 @@ bool CTCServer::Receive(char module, STCPacket *packet, int ms)
+ 	if (pfds->revents & POLLIN)
+ 	{
+ 		rv = receive(pfds->fd, packet);
++		if (! rv && ! moduleMatches(pfds->fd, *packet))
++			rv = true; // closed below
+ 	}
+ 
+ 	// It's possible that even if we read the data, the socket can have an error after the read...
+@@ -533,7 +550,14 @@ void CTCClient::Receive(std::queue<std::unique_ptr<STCPacket>> &queue, int ms)
+ 				p_tcpack.reset();
+ 				Close(pfd.fd);
+ 			}
+-			else
++			else if (! moduleMatches(pfd.fd, *p_tcpack))
++			{
++				// Never process it: Send() cannot route a reply for an
++				// unknown module, and SendToReflector() then loops forever.
++				p_tcpack.reset();
++				Close(pfd.fd);
++			}
++			else if (ECodecType::ping != p_tcpack->codec_in)
+ 			{
+ 				queue.push(std::move(p_tcpack));
+ 			}
+diff --git a/TCSocket.h b/TCSocket.h
+index a22dc5b..93c29b0 100644
+--- a/TCSocket.h
++++ b/TCSocket.h
+@@ -46,6 +46,8 @@ public:
+ 
+ protected:
+ 	bool receive(int fd, STCPacket *packet);
++	bool moduleMatches(int fd, const STCPacket &packet);
++	unsigned long m_BadModule = 0;
+ 	std::vector<struct pollfd> m_Pfd;
+ 	std::string m_Modules;
+ };

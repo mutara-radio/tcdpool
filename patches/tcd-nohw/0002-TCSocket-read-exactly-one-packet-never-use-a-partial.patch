@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:10:28 -0400
+Subject: [PATCH 02/11] TCSocket: read exactly one packet, never use a partial
+ one
+
+receive() called recv(MSG_WAITALL) once. That call can return fewer
+bytes than sizeof(STCPacket) when a signal interrupts it or when the
+peer closes in the middle of a packet. The old code printed a warning
+and returned success, so the caller used a half-filled packet.
+
+Loop until the packet is complete, retry on EINTR, and treat EOF in
+the middle of a packet as a disconnect. receive() no longer closes the
+socket itself; both callers already close it on error, so the socket
+was closed twice before.
+---
+ TCSocket.cpp | 40 +++++++++++++++++++++++++++-------------
+ 1 file changed, 27 insertions(+), 13 deletions(-)
+
+diff --git a/TCSocket.cpp b/TCSocket.cpp
+index 93819d8..0defd81 100644
+--- a/TCSocket.cpp
++++ b/TCSocket.cpp
+@@ -22,6 +22,7 @@
+ #include <sys/types.h>
+ #include <sys/socket.h>
+ #include <sys/select.h>
++#include <cerrno>
+ 
+ #include "TCSocket.h"
+ 
+@@ -151,23 +152,36 @@ bool CTCSocket::Send(const STCPacket *packet)
+ 	return false;
+ }
+ 
++// Read exactly sizeof(STCPacket) bytes from fd.
++// Returns true on an error or a disconnect; the caller closes fd.
++//
++// recv() with MSG_WAITALL can still return fewer bytes: when a signal
++// interrupts it, or when the peer closes in the middle of a packet. The
++// old code printed a warning and then used the half-filled packet. Loop
++// until the packet is complete, retry on EINTR, and treat EOF in the
++// middle of a packet as a disconnect, so a partial packet is never used.
+ bool CTCSocket::receive(int fd, STCPacket *packet)
+ {
+-	auto n = recv(fd, packet, sizeof(STCPacket), MSG_WAITALL);
+-	if (n < 0)
+-	{
+-		perror("Receive recv");
+-		Close(fd);
+-		return true;
+-	}
+-
+-	if (0 == n)
++	auto data = reinterpret_cast<unsigned char *>(packet);
++	size_t count = 0;
++	while (count < sizeof(STCPacket))
+ 	{
+-		return true;
++		auto n = recv(fd, data + count, sizeof(STCPacket) - count, MSG_WAITALL);
++		if (n < 0)
++		{
++			if (EINTR == errno)
++				continue;
++			perror("Receive recv");
++			return true;
++		}
++		if (0 == n)
++		{
++			if (count > 0)
++				std::cerr << "receive(): module '" << GetMod(fd) << "' closed after " << count << " of " << sizeof(STCPacket) << " bytes, the partial packet is dropped" << std::endl;
++			return true;
++		}
++		count += size_t(n);
+ 	}
+-
+-	if (n != sizeof(STCPacket))
+-		std::cout << "receive() only read " << n << " bytes of the transcoder packet from module '" << GetMod(fd) << "'" << std::endl;
+ 	return false;
+ }
+ 

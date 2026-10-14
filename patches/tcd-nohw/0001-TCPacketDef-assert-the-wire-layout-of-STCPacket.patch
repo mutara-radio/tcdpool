@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:10:11 -0400
+Subject: [PATCH 01/11] TCPacketDef: assert the wire layout of STCPacket
+
+The reflector and tcd send STCPacket as raw bytes, so sizeof and
+the field offsets are the wire format. Add static_asserts for the
+size (376), each field offset and the one-byte enum and bool, so a
+compiler or ABI change that would break the link fails at build time.
+
+The values were measured with g++ 14 on aarch64 Linux and match the
+x86-64 System V ABI. ECodecType already has an explicit std::uint8_t
+underlying type, so nothing else changes.
+---
+ TCPacketDef.h | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/TCPacketDef.h b/TCPacketDef.h
+index 68c251c..5f2de19 100644
+--- a/TCPacketDef.h
++++ b/TCPacketDef.h
+@@ -15,7 +15,9 @@
+ // You should have received a copy of the GNU General Public License
+ // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ 
++#include <cstddef>
+ #include <cstdint>
++#include <type_traits>
+ 
+ enum class ECodecType : std::uint8_t { none = 0, dstar = 1, dmr = 2, c2_1600 = 3, c2_3200 = 4, p25 = 5, usrp = 6, ping = 0xff };
+ 
+@@ -31,3 +33,27 @@ using STCPacket = struct tcpacket_tag {
+ 	uint8_t p25[11];
+ 	int16_t usrp[160];
+ };
++
++// Wire layout check.
++//
++// Why: the reflector and tcd exchange this struct as raw bytes, so its
++// size and field offsets are the wire format. A different compiler,
++// ABI or a new field must not change them by accident. These values
++// were measured with g++ 14 on aarch64 Linux (Debian trixie) and match
++// the x86-64 System V ABI. If one of these asserts fails, the build has
++// a different wire format and cannot talk to an unchanged peer.
++static_assert(sizeof(ECodecType) == 1, "ECodecType must be one byte on the wire");
++static_assert(sizeof(bool) == 1, "bool must be one byte on the wire");
++static_assert(std::is_standard_layout<STCPacket>::value, "STCPacket must be standard layout");
++static_assert(std::is_trivially_copyable<STCPacket>::value, "STCPacket must be trivially copyable");
++static_assert(offsetof(STCPacket, sequence) ==   0, "STCPacket::sequence offset");
++static_assert(offsetof(STCPacket, module)   ==   4, "STCPacket::module offset");
++static_assert(offsetof(STCPacket, is_last)  ==   5, "STCPacket::is_last offset");
++static_assert(offsetof(STCPacket, streamid) ==   6, "STCPacket::streamid offset");
++static_assert(offsetof(STCPacket, codec_in) ==   8, "STCPacket::codec_in offset");
++static_assert(offsetof(STCPacket, dstar)    ==   9, "STCPacket::dstar offset");
++static_assert(offsetof(STCPacket, dmr)      ==  18, "STCPacket::dmr offset");
++static_assert(offsetof(STCPacket, m17)      ==  27, "STCPacket::m17 offset");
++static_assert(offsetof(STCPacket, p25)      ==  43, "STCPacket::p25 offset");
++static_assert(offsetof(STCPacket, usrp)     ==  54, "STCPacket::usrp offset");
++static_assert(sizeof(STCPacket)             == 376, "STCPacket size (374 bytes of fields + 2 bytes of tail padding)");

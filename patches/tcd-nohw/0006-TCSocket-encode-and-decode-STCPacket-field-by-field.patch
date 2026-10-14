@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:11:37 -0400
+Subject: [PATCH 06/11] TCSocket: encode and decode STCPacket field by field
+
+Send() and receive() copied the memory of the struct to and from the
+socket. That ties the wire format to the compiler, ABI and byte order,
+puts whatever is in the two padding bytes on the wire, and accepts any
+byte as the is_last bool or as codec_in. A bool that is not 0 or 1 is
+undefined behaviour in C++.
+
+Add EncodeTCPacket()/DecodeTCPacket() in TCPacketCodec.{h,cpp}. They
+write each field at a fixed offset with a fixed width in little-endian
+order, write the padding as zero and ignore it on read. The output is
+byte for byte the struct memory on x86-64 and arm64 Linux, so a peer
+without this change still works. Decode refuses an is_last that is not
+0 or 1 and a codec_in that is not a defined codec (for a ping only
+codec_in is checked). A refused packet closes the link; the reconnect
+starts again on a packet boundary.
+---
+ TCPacketCodec.cpp | 91 +++++++++++++++++++++++++++++++++++++++++++++++
+ TCPacketCodec.h   | 44 +++++++++++++++++++++++
+ TCSocket.cpp      | 26 +++++++++-----
+ 3 files changed, 153 insertions(+), 8 deletions(-)
+ create mode 100644 TCPacketCodec.cpp
+ create mode 100644 TCPacketCodec.h
+
+diff --git a/TCPacketCodec.cpp b/TCPacketCodec.cpp
+new file mode 100644
+index 0000000..a05af07
+--- /dev/null
++++ b/TCPacketCodec.cpp
+@@ -0,0 +1,91 @@
++// Explicit wire encoding of STCPacket. See TCPacketCodec.h.
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++
++#include <cstring>
++
++#include "TCPacketCodec.h"
++
++static inline void put16(uint8_t *p, uint16_t v)
++{
++	p[0] = uint8_t(v);
++	p[1] = uint8_t(v >> 8);
++}
++
++static inline void put32(uint8_t *p, uint32_t v)
++{
++	p[0] = uint8_t(v);
++	p[1] = uint8_t(v >> 8);
++	p[2] = uint8_t(v >> 16);
++	p[3] = uint8_t(v >> 24);
++}
++
++static inline uint16_t get16(const uint8_t *p)
++{
++	return uint16_t(p[0] | (p[1] << 8));
++}
++
++static inline uint32_t get32(const uint8_t *p)
++{
++	return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
++}
++
++bool IsWireCodec(uint8_t value)
++{
++	switch (ECodecType(value))
++	{
++	case ECodecType::dstar:
++	case ECodecType::dmr:
++	case ECodecType::c2_1600:
++	case ECodecType::c2_3200:
++	case ECodecType::p25:
++	case ECodecType::usrp:
++	case ECodecType::ping:
++		return true;
++	default:
++		return false;
++	}
++}
++
++void EncodeTCPacket(const STCPacket &packet, uint8_t *out)
++{
++	memset(out, 0, TCPacketWireSize);
++	put32(out + 0, packet.sequence);
++	out[4] = uint8_t(packet.module);
++	out[5] = packet.is_last ? 1 : 0;
++	put16(out + 6, packet.streamid);
++	out[8] = uint8_t(packet.codec_in);
++	memcpy(out + 9, packet.dstar, 9);
++	memcpy(out + 18, packet.dmr, 9);
++	memcpy(out + 27, packet.m17, 16);
++	memcpy(out + 43, packet.p25, 11);
++	for (unsigned i = 0; i < 160; i++)
++		put16(out + 54 + 2 * i, uint16_t(packet.usrp[i]));
++	// bytes 374 and 375 are padding and stay zero
++}
++
++const char *DecodeTCPacket(const uint8_t *in, STCPacket &packet)
++{
++	if (! IsWireCodec(in[8]))
++		return "codec_in is out of range";
++	const bool ping = (ECodecType(in[8]) == ECodecType::ping);
++	if (! ping && in[5] > 1)
++		return "is_last is not 0 or 1";
++
++	memset(&packet, 0, sizeof(packet));
++	packet.sequence = get32(in + 0);
++	packet.module = char(in[4]);
++	packet.is_last = (in[5] == 1);
++	packet.streamid = get16(in + 6);
++	packet.codec_in = ECodecType(in[8]);
++	memcpy(packet.dstar, in + 9, 9);
++	memcpy(packet.dmr, in + 18, 9);
++	memcpy(packet.m17, in + 27, 16);
++	memcpy(packet.p25, in + 43, 11);
++	for (unsigned i = 0; i < 160; i++)
++		packet.usrp[i] = int16_t(get16(in + 54 + 2 * i));
++	return nullptr;
++}
+diff --git a/TCPacketCodec.h b/TCPacketCodec.h
+new file mode 100644
+index 0000000..59f0145
+--- /dev/null
++++ b/TCPacketCodec.h
+@@ -0,0 +1,44 @@
++#pragma once
++
++// Explicit wire encoding of STCPacket.
++//
++// Why: the link used to send and receive the memory of the struct. That
++// ties the wire format to the compiler, the ABI and the byte order, sends
++// whatever is in the padding bytes, and accepts any byte as a bool or as
++// a codec. These functions write and read each field at a fixed offset,
++// with a fixed width, in little-endian byte order. The result is byte for
++// byte the same as the struct memory on x86-64 and arm64 Linux, so an
++// unchanged peer still works.
++//
++// Wire layout (376 bytes):
++//   0  u32  sequence (little-endian)
++//   4  u8   module letter
++//   5  u8   is_last, 0 or 1
++//   6  u16  streamid (little-endian)
++//   8  u8   codec_in (ECodecType)
++//   9  9    dstar
++//  18  9    dmr
++//  27  16   m17
++//  43  11   p25
++//  54  320  usrp, 160 x s16 (little-endian)
++// 374  2    padding: written as zero, ignored on read
++
++#include <cstddef>
++#include <cstdint>
++
++#include "TCPacketDef.h"
++
++constexpr std::size_t TCPacketWireSize = 376;
++static_assert(TCPacketWireSize == sizeof(STCPacket), "the wire size must equal the native struct size");
++
++// Write packet to out[0..TCPacketWireSize).
++void EncodeTCPacket(const STCPacket &packet, uint8_t *out);
++
++// Read in[0..TCPacketWireSize) into packet.
++// Returns nullptr on success, or a short static text that says why the
++// bytes are not a valid packet. For a ping only codec_in is checked;
++// the other fields of a ping have no meaning.
++const char *DecodeTCPacket(const uint8_t *in, STCPacket &packet);
++
++// True for a codec_in value that a peer may send.
++bool IsWireCodec(uint8_t value);
+diff --git a/TCSocket.cpp b/TCSocket.cpp
+index ba3c5f1..c3d7908 100644
+--- a/TCSocket.cpp
++++ b/TCSocket.cpp
+@@ -25,6 +25,7 @@
+ #include <cerrno>
+ 
+ #include "TCSocket.h"
++#include "TCPacketCodec.h"
+ 
+ void CTCSocket::Close()
+ {
+@@ -131,12 +132,13 @@ bool CTCSocket::Send(const STCPacket *packet)
+ 	if (m_Pfd[pos].fd < 0)
+ 		return true; // not connected; the caller reconnects
+ 
++	uint8_t data[TCPacketWireSize];
++	EncodeTCPacket(*packet, data);
+ 	unsigned count = 0;
+-	auto data = (const unsigned char *)packet;
+ 	do {
+ 		// MSG_NOSIGNAL: a peer that closed must give EPIPE, not a SIGPIPE
+ 		// that ends the whole process.
+-		auto n = send(m_Pfd[pos].fd, data+count, sizeof(STCPacket)-count, MSG_NOSIGNAL);
++		auto n = send(m_Pfd[pos].fd, data+count, TCPacketWireSize-count, MSG_NOSIGNAL);
+ 		if (n < 0 && EINTR == errno)
+ 			continue;
+ 		if (n <= 0)
+@@ -153,11 +155,11 @@ bool CTCSocket::Send(const STCPacket *packet)
+ 			return true;
+ 		}
+ 		count += n;
+-	} while (count < sizeof(STCPacket));
++	} while (count < TCPacketWireSize);
+ 	return false;
+ }
+ 
+-// Read exactly sizeof(STCPacket) bytes from fd.
++// Read exactly one wire packet (TCPacketWireSize bytes) from fd.
+ // Returns true on an error or a disconnect; the caller closes fd.
+ //
+ // recv() with MSG_WAITALL can still return fewer bytes: when a signal
+@@ -167,11 +169,11 @@ bool CTCSocket::Send(const STCPacket *packet)
+ // middle of a packet as a disconnect, so a partial packet is never used.
+ bool CTCSocket::receive(int fd, STCPacket *packet)
+ {
+-	auto data = reinterpret_cast<unsigned char *>(packet);
++	uint8_t data[TCPacketWireSize];
+ 	size_t count = 0;
+-	while (count < sizeof(STCPacket))
++	while (count < TCPacketWireSize)
+ 	{
+-		auto n = recv(fd, data + count, sizeof(STCPacket) - count, MSG_WAITALL);
++		auto n = recv(fd, data + count, TCPacketWireSize - count, MSG_WAITALL);
+ 		if (n < 0)
+ 		{
+ 			if (EINTR == errno)
+@@ -182,11 +184,19 @@ bool CTCSocket::receive(int fd, STCPacket *packet)
+ 		if (0 == n)
+ 		{
+ 			if (count > 0)
+-				std::cerr << "receive(): module '" << GetMod(fd) << "' closed after " << count << " of " << sizeof(STCPacket) << " bytes, the partial packet is dropped" << std::endl;
++				std::cerr << "receive(): module '" << GetMod(fd) << "' closed after " << count << " of " << TCPacketWireSize << " bytes, the partial packet is dropped" << std::endl;
+ 			return true;
+ 		}
+ 		count += size_t(n);
+ 	}
++	const char *why = DecodeTCPacket(data, *packet);
++	if (why)
++	{
++		// The byte stream is out of step or the peer is broken. Close the
++		// link; the reconnect starts again on a packet boundary.
++		std::cerr << "receive(): bad packet on module '" << GetMod(fd) << "': " << why << ", closing the link" << std::endl;
++		return true;
++	}
+ 	return false;
+ }
+ 

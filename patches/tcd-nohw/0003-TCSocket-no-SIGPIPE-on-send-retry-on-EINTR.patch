@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:10:37 -0400
+Subject: [PATCH 03/11] TCSocket: no SIGPIPE on send, retry on EINTR
+
+Send() used send(..., 0). When the peer has closed the connection,
+the next send raises SIGPIPE, and the default action ends the whole
+process, so one dropped link stopped every module. Use MSG_NOSIGNAL so
+the error comes back as EPIPE and the normal close and reconnect path
+runs.
+
+Also retry a send that a signal interrupts (EINTR) instead of treating
+it as a closed link, and do not call send() on a closed socket (fd -1).
+---
+ TCSocket.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/TCSocket.cpp b/TCSocket.cpp
+index 0defd81..1dab87f 100644
+--- a/TCSocket.cpp
++++ b/TCSocket.cpp
+@@ -130,10 +130,17 @@ bool CTCSocket::Send(const STCPacket *packet)
+ 			return true;
+ 		}
+ 	}
++	if (m_Pfd[pos].fd < 0)
++		return true; // not connected; the caller reconnects
++
+ 	unsigned count = 0;
+ 	auto data = (const unsigned char *)packet;
+ 	do {
+-		auto n = send(m_Pfd[pos].fd, data+count, sizeof(STCPacket)-count, 0);
++		// MSG_NOSIGNAL: a peer that closed must give EPIPE, not a SIGPIPE
++		// that ends the whole process.
++		auto n = send(m_Pfd[pos].fd, data+count, sizeof(STCPacket)-count, MSG_NOSIGNAL);
++		if (n < 0 && EINTR == errno)
++			continue;
+ 		if (n <= 0)
+ 		{
+ 			if (0 == n)

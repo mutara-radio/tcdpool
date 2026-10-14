@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:10:46 -0400
+Subject: [PATCH 04/11] TCSocket: send a zeroed ping with a real module letter
+
+ReConnect() sent its keep-alive ping from an uninitialized STCPacket on
+the stack. Only codec_in was set, so 375 bytes of old stack memory went
+on the wire, and the module byte was random. Send() then used module
+slot 0 only because the random byte was usually not a configured
+letter.
+
+Zero the packet and set module to the first configured letter. The
+wire format does not change: a ping is still one STCPacket with
+codec_in == ping.
+---
+ TCSocket.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/TCSocket.cpp b/TCSocket.cpp
+index 1dab87f..20f6fbc 100644
+--- a/TCSocket.cpp
++++ b/TCSocket.cpp
+@@ -486,7 +486,10 @@ void CTCClient::ReConnect() // and sometimes ping
+ 	
+ 	if(secs.count() > 5.0)
+ 	{
+-		STCPacket ping;
++		// Zero the whole packet: the old code sent uninitialized stack
++		// bytes, and a random module byte that Send() then had to guess at.
++		STCPacket ping{};
++		ping.module = m_Modules.empty() ? ' ' : m_Modules[0];
+ 		ping.codec_in = ECodecType::ping;
+ 		Send(&ping);
+ 		start = now;

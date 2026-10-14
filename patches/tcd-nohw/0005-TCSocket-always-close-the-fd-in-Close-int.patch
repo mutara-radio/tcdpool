@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Trinity AI Agent <267220563+trinity-ai-agent@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:10:55 -0400
+Subject: [PATCH 05/11] TCSocket: always close the fd in Close(int)
+
+Close(int fd) called close() only when shutdown() succeeded.
+shutdown() fails with ENOTCONN when the peer has already reset the
+connection, which is exactly when the link must be dropped. The fd then
+leaked, stayed in m_Pfd, and ReConnect() never saw the module as
+closed, so the module stayed dead.
+
+Always close the descriptor and set the slot to -1. Log a shutdown()
+error only when it is not ENOTCONN.
+---
+ TCSocket.cpp | 20 +++++++++-----------
+ 1 file changed, 9 insertions(+), 11 deletions(-)
+
+diff --git a/TCSocket.cpp b/TCSocket.cpp
+index 20f6fbc..ba3c5f1 100644
+--- a/TCSocket.cpp
++++ b/TCSocket.cpp
+@@ -65,20 +65,18 @@ void CTCSocket::Close(int fd)
+ 	{
+ 		if (fd == p.fd)
+ 		{
+-			if (shutdown(p.fd, SHUT_RDWR))
+-			{
++			// shutdown() fails with ENOTCONN when the peer has already
++			// reset the link. The old code then skipped close(), leaked the
++			// descriptor and kept the dead fd, so the module never
++			// reconnected. Always close and always forget the fd.
++			if (shutdown(p.fd, SHUT_RDWR) && ENOTCONN != errno)
+ 				perror("shutdown");
+-			}
+-			else
++			if (close(p.fd))
+ 			{
+-				if (close(p.fd))
+-				{
+-					std::cerr << "Error while closing " << fd << ": ";
+-					perror("close");
+-				}
+-				else
+-					p.fd = -1;
++				std::cerr << "Error while closing " << fd << ": ";
++				perror("close");
+ 			}
++			p.fd = -1;
+ 			return;
+ 		}
+ 	}
