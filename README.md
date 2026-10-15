@@ -21,6 +21,8 @@ gives each client session its own tcd process.
 - Each process has stats: frames, latency, late and missing frames,
   restarts and CPU time. The client can ask for them, and the admin
   endpoint on loopback shows them.
+- A client can read `GET /v1/status` with its key: the load of the
+  server (ok, busy or full) and the sessions of its own key.
 
 tcdpool is one static Go binary (no cgo). The image has tcdpool and a
 patched tcd.
@@ -183,9 +185,23 @@ closes its connections with the error `key_revoked`.
 - `max_processes` limits the tcd processes on the host. A client gets
   `host_full` when the host is full.
 - Each key has a limit. A client gets `key_limit` when its key is at
-  the limit.
+  the limit. The error has `in_use` and `max`, for example
+  `no free session for this key: 2 of 2 in use`.
 - To make room, the server stops the process that has been idle for
   the longest time. It never stops a process that has a connection.
+
+Client status, on the client port with the client key (see
+[docs/protocol.md](docs/protocol.md) section 12):
+
+```
+curl -sk -H "Authorization: Bearer $TOKEN" https://127.0.0.1:8443/v1/status
+```
+
+It shows the version, the processes of the host and their limit, the
+sessions of the caller's key and their limit, the CPU load (Linux),
+the late rate and a state: `ok`, `busy` (80 % of the processes in use,
+CPU load 0.8 for each CPU, or 2 % late replies) or `full` (no free
+process). It never shows other keys or session names.
 
 Admin endpoint (loopback only):
 

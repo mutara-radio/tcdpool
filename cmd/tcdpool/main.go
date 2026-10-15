@@ -111,6 +111,8 @@ func serve(args []string) error {
 		Keys:            ks,
 		Backend:         nb,
 		KeyMaxProcesses: cfg.KeyMaxProcesses,
+		MaxProcesses:    cfg.MaxProcesses,
+		Version:         buildVersion(),
 		IdleTimeout:     cfg.IdleTimeout.D(),
 		LateAfter:       cfg.LateAfter.D(),
 		Logf:            logf,

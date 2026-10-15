@@ -29,6 +29,8 @@ type Options struct {
 	Keys            *keys.Store
 	Backend         backend.Backend
 	KeyMaxProcesses int
+	MaxProcesses    int    // host limit, for GET /v1/status
+	Version         string // server version, for GET /v1/status
 	IdleTimeout     time.Duration
 	LateAfter       time.Duration
 	Logf            func(format string, args ...any)
@@ -48,10 +50,12 @@ func New(opt Options) *Server {
 	return &Server{opt: opt}
 }
 
-// Handler returns the client handler: /v1/stream and /healthz.
+// Handler returns the client handler: /v1/stream, /v1/status and
+// /healthz.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/stream", s.stream)
+	mux.HandleFunc("GET /v1/status", s.status)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok\n")) })
 	return mux
 }
@@ -65,15 +69,8 @@ func httpError(w http.ResponseWriter, status int, code, msg string) {
 var sessionRE = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
 
 func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
-	key, err := s.opt.Keys.Verify(r.Header.Get("Authorization"))
-	switch {
-	case errors.Is(err, keys.ErrDisabled):
-		s.opt.Logf("server: %s: refused, key %s is disabled", r.RemoteAddr, key.ID)
-		httpError(w, http.StatusForbidden, protocol.ErrKeyDisabled, "the key is disabled")
-		return
-	case err != nil:
-		s.opt.Logf("server: %s: refused, bad or unknown key", r.RemoteAddr)
-		httpError(w, http.StatusUnauthorized, protocol.ErrUnauthorized, "send Authorization: Bearer <key id>.<secret>")
+	key, ok := s.auth(w, r)
+	if !ok {
 		return
 	}
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
@@ -142,7 +139,11 @@ func (ss *session) sendJSON(v any) {
 }
 
 func (ss *session) fail(code, msg string, status websocket.StatusCode) {
-	b, _ := json.Marshal(protocol.Error{Type: protocol.MsgError, Code: code, Message: msg, Fatal: true})
+	ss.failWith(protocol.Error{Type: protocol.MsgError, Code: code, Message: msg, Fatal: true}, status)
+}
+
+func (ss *session) failWith(e protocol.Error, status websocket.StatusCode) {
+	b, _ := json.Marshal(e)
 	ss.queue(outMsg{typ: websocket.MessageText, data: b, close: true, code: status})
 	ss.closing.Store(true)
 }
@@ -282,24 +283,25 @@ func (ss *session) run(ctx context.Context) {
 		return
 	}
 	ss.name = h.Session
-	keyMax := ss.key.MaxProcesses
-	if keyMax == 0 {
-		keyMax = ss.srv.opt.KeyMaxProcesses
-	}
+	keyMax := ss.srv.keyMax(ss.key)
 	att, reused, err := ss.srv.opt.Pool.Attach(ctx, pool.Key{KeyID: ss.key.ID, Session: h.Session}, keyMax, ss.key.Label, ss)
 	if err != nil {
-		code, status := protocol.ErrBackendStart, websocket.StatusInternalError
+		e := protocol.Error{Type: protocol.MsgError, Code: protocol.ErrBackendStart, Message: err.Error(), Fatal: true}
+		status := websocket.StatusInternalError
 		switch {
 		case errors.Is(err, pool.ErrKeyLimit):
-			code, status = protocol.ErrKeyLimit, websocket.StatusPolicyViolation
-			err = fmt.Errorf("%w (%d)", err, keyMax)
+			e.Code, status = protocol.ErrKeyLimit, websocket.StatusPolicyViolation
+			e.InUse, e.Max = ss.srv.keySessions(ss.key.ID), keyMax
+			e.Message = fmt.Sprintf("no free session for this key: %d of %d in use", e.InUse, e.Max)
 		case errors.Is(err, pool.ErrHostFull):
-			code, status = protocol.ErrHostFull, websocket.StatusTryAgainLater
+			e.Code, status = protocol.ErrHostFull, websocket.StatusTryAgainLater
+			e.InUse, e.Max = ss.srv.opt.Pool.Count(), ss.srv.opt.MaxProcesses
+			e.Message = fmt.Sprintf("no free process on the server: %d of %d in use", e.InUse, e.Max)
 		case errors.Is(err, pool.ErrShuttingDown):
-			code, status = protocol.ErrShuttingDown, websocket.StatusGoingAway
+			e.Code, status = protocol.ErrShuttingDown, websocket.StatusGoingAway
 		}
-		ss.logf("refused: %v", err)
-		ss.fail(code, err.Error(), status)
+		ss.logf("refused: %s", e.Message)
+		ss.failWith(e, status)
 		return
 	}
 	ss.att = att
@@ -388,6 +390,17 @@ func (ss *session) readLoop(ctx context.Context) bool {
 			}
 		}
 	}
+}
+
+// keySessions counts the processes of a key.
+func (s *Server) keySessions(keyID string) int {
+	n := 0
+	for _, p := range s.opt.Pool.Stats() {
+		if p.KeyID == keyID {
+			n++
+		}
+	}
+	return n
 }
 
 // Sessions returns the number of open client connections.

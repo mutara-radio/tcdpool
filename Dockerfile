@@ -130,8 +130,10 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
+# VERSION is shown in GET /v1/status (scripts/build-image.sh sets it).
+ARG VERSION=dev
 RUN go vet ./... \
-    && go build -trimpath -ldflags="-s -w" -o /out/tcdpool ./cmd/tcdpool \
+    && go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/tcdpool ./cmd/tcdpool \
     && go build -trimpath -ldflags="-s -w" -o /out/tcdpool-client ./cmd/tcdpool-client
 
 ########################################################################
