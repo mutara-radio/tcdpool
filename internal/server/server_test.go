@@ -59,7 +59,7 @@ func setup(t *testing.T, keyMax int) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := New(Options{Pool: p, Keys: ks, Backend: nb, KeyMaxProcesses: 2, IdleTimeout: time.Minute, LateAfter: 60 * time.Millisecond, Logf: t.Logf})
+	s := New(Options{Pool: p, Keys: ks, Backend: nb, KeyMaxProcesses: 2, MaxProcesses: 4, Version: "test", IdleTimeout: time.Minute, LateAfter: 60 * time.Millisecond, Logf: t.Logf})
 	ts := httptest.NewTLSServer(s.Handler())
 	t.Cleanup(ts.Close)
 	return &env{ts: ts, srv: s, pool: p, keysPath: kp, token: tok, keyID: k.ID}
@@ -221,7 +221,8 @@ func TestLimitsAndRevoke(t *testing.T) {
 		t.Fatal(m)
 	}
 	c2, _, _ := e.dial(t, e.token)
-	if m := hello(t, c2, "node-2201"); m["code"] != protocol.ErrKeyLimit {
+	if m := hello(t, c2, "node-2201"); m["code"] != protocol.ErrKeyLimit || m["in_use"] != 1.0 || m["max"] != 1.0 ||
+		m["message"] != "no free session for this key: 1 of 1 in use" {
 		t.Fatalf("second session: %v", m)
 	}
 	// a second connection to the same session replaces the first

@@ -233,6 +233,10 @@ type Error struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 	Fatal   bool   `json:"fatal"`
+	// InUse and Max are set for key_limit (sessions of the key) and
+	// host_full (processes of the host).
+	InUse int `json:"in_use,omitempty"`
+	Max   int `json:"max,omitempty"`
 }
 
 // StatsRequest asks for the stats of the session process.

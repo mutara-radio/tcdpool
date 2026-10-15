@@ -16,6 +16,8 @@ the result back on the same WebSocket.
 - Binary WebSocket messages carry voice frames.
 - Text WebSocket messages carry control messages in JSON.
 - All numbers in binary frames are little-endian.
+- `GET /v1/status` gives the load of the server and the sessions of
+  your key (section 12).
 
 ## 2. Connect and authenticate
 
@@ -265,11 +267,16 @@ A normal close of the WebSocket has the same effect as `bye` without
 ### 8.2 Errors
 
 ```json
-{"type":"error","code":"key_limit","message":"the key has its maximum number of processes (2)","fatal":true}
+{"type":"error","code":"key_limit","message":"no free session for this key: 2 of 2 in use","fatal":true,"in_use":2,"max":2}
 ```
 
 When `fatal` is `true`, the server closes the WebSocket after the
 message, with the close code in this table.
+
+`key_limit` and `host_full` also have `in_use` and `max`: the sessions
+of the key and its limit, or the processes of the host and its limit.
+Use `code`, `in_use` and `max` in a program. `message` is for people,
+and its text can change.
 
 | Code | Fatal | Close | Meaning | What to do |
 |---|---|---|---|---|
@@ -350,3 +357,64 @@ d1 d2 d3 d4 d5 d6 d7 d8 d9 c1 c2 c3 c4 c5 c6 c7 c8
    Use a backoff of at least 1 s, doubled after each failure.
 8. At the end, send `bye`. Send `"stop": true` only when the session
    will not come back soon.
+9. To show the load of the server, read `GET /v1/status` (section 12)
+   not more than one time each 30 s.
+
+## 12. Status
+
+```
+GET https://<host>:<port>/v1/status
+Authorization: Bearer <key id>.<secret>
+```
+
+This is a plain HTTPS request on the same port as `/v1/stream`, with
+the same key. A bad key gets the same HTTP errors as `/v1/stream`
+(section 2): 401 `unauthorized` or 403 `key_disabled`. The reply is
+read-only JSON:
+
+```json
+{"version":"v0.4.0","protocol":1,"backend":"nostar-tcd",
+ "state":"busy","reasons":["processes_busy"],
+ "processes":{"running":7,"idle":1,"max":8},
+ "key":{"id":"k3f9a0c12be47","sessions":2,"idle":0,"max_sessions":2,"full":true},
+ "cpu_load":0.41,"cpus":4,
+ "late_rate":0.0031,"frames":182250,
+ "time":"2026-10-15T14:02:11Z"}
+```
+
+| Field | Meaning |
+|---|---|
+| `version` | The tcdpool version (`dev` for a local build). |
+| `protocol` | The protocol version (1). |
+| `backend` | The transcoder backend. |
+| `state` | `ok`, `busy` or `full` (see below). |
+| `reasons` | Why the state is not `ok`: `host_full`, `processes_busy`, `cpu_busy`, `late_replies`. Not present when the state is `ok`. |
+| `processes.running` | tcd processes on the host, idle ones too. |
+| `processes.idle` | Processes with no connection. The server can stop them to make room. |
+| `processes.max` | The process limit of the host (`max_processes`). |
+| `key.sessions` | Sessions (processes) of your key, idle ones too. |
+| `key.idle` | Sessions of your key with no connection. |
+| `key.max_sessions` | The session limit of your key. |
+| `key.full` | `true` when a new session of your key gets `key_limit` now: `sessions` is `max_sessions` or more and none is idle. |
+| `cpu_load` | The 1-minute load average of the host divided by `cpus`. Only on Linux; not present elsewhere. |
+| `cpus` | The CPUs of the host. |
+| `late_rate` | Late replies divided by all replies (`frames`), for the processes that run now, from their first start. |
+| `frames` | Replies of the processes that run now. |
+| `time` | The server time (UTC). |
+
+State:
+
+- `full`: `processes.running` is `processes.max` and no process is
+  idle. A new session gets `host_full`.
+- `busy`: not full, and one of these is true:
+  - 80 % or more of `processes.max` have a connection
+    (`running - idle`): `processes_busy`.
+  - `cpu_load` is 0.8 or more: `cpu_busy`.
+  - `late_rate` is 0.02 (2 %) or more, after 500 `frames` or more:
+    `late_replies`.
+- `ok`: all else.
+
+The key limit does not change `state`. Use `key.full` for it.
+
+The status never shows other keys, their labels or their session
+names. Ask for it not more than one time each 30 s.

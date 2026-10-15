@@ -45,7 +45,10 @@ go list -m -f '{{if not .Main}}{{.Path}} {{.Version}}{{end}}' all | while read -
 	printf '%s\n' "$version" >>"$work/goproxy/$esc/@v/list"
 done
 
+# The version that GET /v1/status shows.
+build_version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
 $docker build \
+	--build-arg VERSION="$build_version" \
 	--build-context md380core="$work/md380core" \
 	--build-context goproxy="$work/goproxy" \
 	--target "$target" -t "$tag" "$root"
