@@ -251,6 +251,13 @@ There were no late and no missing frames.
 
 ## Licences
 
+Original tcdpool code is licensed under **GPL-3.0-or-later**, matching
+nostar/tcd. See [LICENSE](LICENSE) and [LICENSING.md](LICENSING.md) for the
+scope, third-party attributions and the firmware utility's separate custom terms and retained licensing uncertainty.
+Third-party material retains its own licenses; the root license does not
+relicense it. This is a source-only release; no binaries or images are
+supplied.
+
 tcdpool's own code is in this repository. The image also contains
 third-party code with its own licences. **The person or group that
 builds, runs or distributes tcdpool or its image must decide if they
@@ -260,13 +267,14 @@ licence claims of Digital Voice Systems, Inc. in some places.
 
 | Part | Where | Licence |
 |---|---|---|
-| tcd (nostar) | downloaded at build, patched by `patches/tcd-nohw` | GPL-3.0 |
-| tcd patches | `patches/tcd-nohw` | GPL-3.0 (the licence of tcd) |
+| tcd (nostar) | downloaded at build, patched by `patches/tcd-nohw` | GPL-3.0-or-later |
+| tcd patches | `patches/tcd-nohw` | GPL-3.0-or-later (the licence of tcd) |
 | Codec2 (in tcd, `codec2/`) | downloaded with tcd | LGPL-2.1 |
+| Kiss FFT (in tcd, `codec2/kiss_fft.cpp`) | downloaded with tcd | BSD-3-Clause |
 | mbe vocoder (in tcd, `mbe/`; D-Star AMBE) | downloaded with tcd | ISC |
 | IMBE vocoder (OP25) | `third_party/imbe_vocoder` | GPL-3.0-or-later |
-| md380_vocoder_dynarmic (AMBE+2) | `third_party/md380_vocoder_dynarmic` | GPL-3.0 (LICENSE); some headers GPL-2.0-or-later |
-| dynarmic | downloaded at build | 0BSD; its bundled libraries are MIT or BSD |
+| md380_vocoder_dynarmic (AMBE+2) | `third_party/md380_vocoder_dynarmic` | GPL-3.0 (LICENSE); header GPL-2.0-or-later; firmware utility has separate custom beerware terms (see LICENSING.md) |
+| dynarmic | downloaded at build | 0BSD; bundled dependencies have separate MIT/BSL-1.0 notices (see LICENSING.md) |
 | TYT MD-380 firmware 2.32 (runs in the AMBE+2 emulator) | downloaded at build from md380.org; the SRAM core image `d02032-core.img` comes from the builder | Proprietary (TYT). Not in this repository. |
 | Boost (headers, build only) | Debian package | BSL-1.0 |
 | coder/websocket v1.8.15 | Go module | ISC |
